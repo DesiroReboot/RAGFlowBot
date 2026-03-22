@@ -63,6 +63,53 @@ copy .env.example .env
 py -m src.main
 ```
 
+### 0) Docker 运行（迁移后推荐）
+
+首次构建并启动：
+
+```powershell
+docker compose up -d --build
+```
+
+查看日志：
+
+```powershell
+docker compose logs -f ecbot
+```
+
+停止：
+
+```powershell
+docker compose down
+```
+
+说明：
+- 已提供 `Dockerfile`、`docker-compose.yml`、`.dockerignore`、`requirements.txt`。
+- 默认挂载目录：`./config`、`./DB`、`./logs`、`./Eval`、`./kb`。
+- 容器默认读取 `.env`，并将知识库目录固定为容器内 `/app/kb`（由 `ECBOT_KB_SOURCE_DIR=/app/kb` 覆盖）。
+- 当前镜像以“最小可运行”为目标；若需容器内 OCR，请在镜像中额外安装 `tesseract-ocr` 与对应语言包。
+- 已内置 Docker healthcheck：
+  - `receive_mode=long_connection`：检查最近长连接状态文件（默认路径 `/tmp/ecbot_longconn_health.json`）。
+  - `receive_mode=webhook`：检查 `http://127.0.0.1:8000/health`。
+
+查看健康状态：
+
+```powershell
+docker inspect ecbot --format "{{json .State.Health}}"
+```
+
+若你使用 `webhook` 模式，确保 `.env` 或 `config/config.json` 里设置：
+
+```text
+ECBOT_FEISHU_RECEIVE_MODE=webhook
+```
+
+若你使用 `long_connection` 模式，保持：
+
+```text
+ECBOT_FEISHU_RECEIVE_MODE=long_connection
+```
+
 ### 2) 直接使用 uvicorn（仅 webhook 模式）
 
 ```powershell

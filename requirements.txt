@@ -1,0 +1,7 @@
+fastapi==0.115.12
+uvicorn==0.34.0
+lark-oapi==1.4.24
+pypdf==5.4.0
+PyMuPDF==1.25.5
+Pillow==11.1.0
+pytesseract==0.3.13

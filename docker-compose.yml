@@ -1,0 +1,33 @@
+services:
+  ecbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ecbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      ECBOT_CONFIG_PATH: /app/config/config.json
+      ECBOT_KB_SOURCE_DIR: /app/kb
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
+      http_proxy: ""
+      https_proxy: ""
+      NO_PROXY: ""
+      no_proxy: ""
+    volumes:
+      - ./config:/app/config
+      - ./DB:/app/DB
+      - ./logs:/app/logs
+      - ./Eval:/app/Eval
+      - ./kb:/app/kb
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-m", "src.fastapi_gateway.healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    command: ["python", "-m", "src.main"]

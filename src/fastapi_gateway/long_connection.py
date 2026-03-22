@@ -1,10 +1,53 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+from pathlib import Path
+import time
 from typing import Any
 
 from src.config import Config
 from src.fastapi_gateway.services.event_service import FeishuEventService
+
+
+def _health_file_path() -> Path:
+    raw = str(os.getenv("ECBOT_LONG_CONN_HEALTH_PATH", "/tmp/ecbot_longconn_health.json")).strip()
+    return Path(raw or "/tmp/ecbot_longconn_health.json")
+
+
+def _write_connection_health(status: str, detail: str = "") -> None:
+    payload = {
+        "status": status,
+        "detail": detail,
+        "updated_at": time.time(),
+    }
+    path = _health_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=True), encoding="utf-8")
+
+
+class _LarkConnectionHealthHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = str(record.getMessage())
+        except Exception:
+            return
+
+        lowered = message.lower()
+        if "connected to wss://" in lowered:
+            _write_connection_health("connected", message)
+            return
+        if "connect failed" in lowered or "trying to reconnect" in lowered:
+            _write_connection_health("reconnecting", message)
+
+
+def _install_connection_health_handler() -> None:
+    logger = logging.getLogger("Lark")
+    for handler in logger.handlers:
+        if isinstance(handler, _LarkConnectionHealthHandler):
+            return
+    logger.addHandler(_LarkConnectionHealthHandler())
 
 
 def _resolve_lark_log_level(lark_module: Any, configured_level: str) -> Any:
@@ -59,6 +102,8 @@ def _to_event_payload(data: Any) -> dict[str, Any]:
 def run_long_connection_client(config: Config | None = None) -> None:
     cfg = config or Config()
     service = FeishuEventService(cfg)
+    _install_connection_health_handler()
+    _write_connection_health("starting")
 
     try:
         import lark_oapi as lark  # type: ignore[import-untyped]
