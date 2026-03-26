@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from types import SimpleNamespace
 
@@ -107,3 +107,22 @@ def test_compose_answer_uses_hybrid_when_quality_checks_pass() -> None:
     assert answer == hybrid_answer
     assert meta["final_mode"] == "hybrid"
     assert meta["fallback_reason"] == ""
+
+
+def test_run_sync_returns_domain_out_of_scope_fallback_when_filter_blocks() -> None:
+    agent = ReActAgent.__new__(ReActAgent)
+    agent.search_orchestrator = SimpleNamespace(
+        search_with_trace=lambda query: SimpleNamespace(  # noqa: ARG005
+            hits=[],
+            citations=[],
+            retrieval_confidence=0.0,
+            trace_search={"planner": {"allow_rag": False, "filter_reason": "score_below_threshold"}},
+        )
+    )
+    agent.manifest_store = SimpleNamespace(get_manifest=lambda: {"build_version": "rag-v2"})
+
+    response = agent.run_sync("今天NBA谁会赢", include_trace=True)
+
+    assert "外贸/跨境电商" in response.answer
+    assert response.trace["strategy_execution"][0]["reason"] == "domain_out_of_scope"
+    assert response.trace["strategy_execution"][0]["filter_reason"] == "score_below_threshold"

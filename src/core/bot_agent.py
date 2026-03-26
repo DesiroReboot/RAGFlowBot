@@ -83,7 +83,11 @@ class ReActAgent:
             embedding_timeout=config.embedding.timeout,
             embedding_max_retries=config.embedding.max_retries,
         )
-        self.planner = RulePlanner()
+        self.planner = RulePlanner(
+            domain_filter_enabled=config.search.domain_filter_enabled,
+            domain_filter_threshold=config.search.domain_filter_threshold,
+            domain_filter_fail_open=config.search.domain_filter_fail_open,
+        )
         self.search_orchestrator = SearchOrchestrator(
             planner=self.planner,
             rag_searcher=self.rag_searcher,
@@ -106,16 +110,28 @@ class ReActAgent:
         }
 
         if not results:
-            reason = "index_not_ready" if not manifest else "no_retrieval_results"
-            answer = (
-                "当前索引未就绪，请先执行离线知识库同步。"
-                if reason == "index_not_ready"
-                else "未从知识库检索到足够相关的内容，请补充更具体的问题后重试。"
-            )
+            planner_trace = search_trace.get("planner", {}) if isinstance(search_trace, dict) else {}
+            allow_rag = bool(planner_trace.get("allow_rag", True))
+            filter_reason = str(planner_trace.get("filter_reason", "")).strip()
+
+            if not allow_rag:
+                reason = "domain_out_of_scope"
+                answer = (
+                    "当前问题不在外贸/跨境电商知识域内，已跳过知识库检索。"
+                    "请改问选品、Listing、广告投放、物流、关税、平台运营等相关问题。"
+                )
+            else:
+                reason = "index_not_ready" if not manifest else "no_retrieval_results"
+                answer = (
+                    "当前索引尚未就绪，请先执行离线知识库同步。"
+                    if reason == "index_not_ready"
+                    else "未从知识库检索到足够相关内容，请补充更具体的问题后重试。"
+                )
             trace["strategy_execution"].append(
                 {
                     "stage": "fallback_answer",
                     "reason": reason,
+                    "filter_reason": filter_reason,
                 }
             )
             trace["final_answer_preview"] = answer

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import hashlib
 import json
+import logging
 from threading import Lock
 import time
 from typing import Any
@@ -12,6 +14,8 @@ from src.core.bot_agent import ReActAgent
 from src.fastapi_gateway.security.verifier import FeishuAuthVerifier
 from src.fastapi_gateway.services.feishu_client import FeishuAPIClient
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class GatewayResult:
@@ -19,6 +23,7 @@ class GatewayResult:
     message: str
     fallback_type: str | None = None
     embedding_dialog: dict[str, Any] | None = None
+    debug_trace: dict[str, Any] | None = None
 
 
 class FeishuEventService:
@@ -251,7 +256,7 @@ class FeishuEventService:
 
         reply_result = self._reply_to_event(event_data=event_data, text=result.message)
         token_dialog = self.api_client.token_dialog_payload()
-        return {
+        payload = {
             "success": result.success,
             "message": result.message,
             "fallback_type": result.fallback_type,
@@ -259,8 +264,11 @@ class FeishuEventService:
             "reply_error": reply_result.get("error", ""),
             "token_dialog": token_dialog if not token_dialog["ok"] else None,
             "embedding_dialog": result.embedding_dialog,
+            "debug_trace": result.debug_trace,
             "timestamp": datetime.now(UTC).isoformat(),
         }
+        self._log_debug_trace(event_data=event_data, result=payload)
+        return payload
 
     def _extract_query(self, event_data: dict[str, Any]) -> str:
         event = self._extract_event(event_data)
@@ -284,14 +292,17 @@ class FeishuEventService:
                 success=False,
                 message=self._fallback_message("timeout"),
                 fallback_type="timeout",
+                debug_trace={"error": "timeout"},
             )
         except Exception:
             return GatewayResult(
                 success=False,
                 message=self._fallback_message("error"),
                 fallback_type="error",
+                debug_trace={"error": "internal_error"},
             )
         embedding_dialog = self._embedding_dialog_from_trace(response.trace)
+        debug_trace = self._extract_debug_trace(trace=response.trace, query=query)
 
         output_guardrail = self.config.guardrails.output
         if (
@@ -303,12 +314,14 @@ class FeishuEventService:
                 message=self._fallback_message("no_rag_hit"),
                 fallback_type="no_rag_hit",
                 embedding_dialog=embedding_dialog,
+                debug_trace=debug_trace,
             )
 
         return GatewayResult(
             success=True,
             message=response.answer,
             embedding_dialog=embedding_dialog,
+            debug_trace=debug_trace,
         )
 
     def _reply_to_event(self, *, event_data: dict[str, Any], text: str) -> dict[str, Any]:
@@ -430,6 +443,59 @@ class FeishuEventService:
             "message": "embedding 调用失败，请检查 ECBOT_EMBEDDING_API_KEY / ECBOT_EMBEDDING_MODEL。",
             "detail": vec_error,
         }
+
+    @staticmethod
+    def _extract_debug_trace(*, trace: dict[str, Any], query: str) -> dict[str, Any]:
+        search_trace = trace.get("search", {}) if isinstance(trace, dict) else {}
+        planner = search_trace.get("planner", {}) if isinstance(search_trace, dict) else {}
+        rag = search_trace.get("rag", {}) if isinstance(search_trace, dict) else {}
+        strategy_execution = (
+            trace.get("strategy_execution", []) if isinstance(trace, dict) else []
+        )
+        fallback_reason = ""
+        if isinstance(strategy_execution, list) and strategy_execution:
+            first = strategy_execution[0]
+            if isinstance(first, dict):
+                fallback_reason = str(first.get("reason", "")).strip()
+
+        query_hash = hashlib.md5(str(query or "").encode("utf-8")).hexdigest()[:10]
+        query_preview = str(query or "").strip().replace("\n", " ")[:40]
+        final_results = search_trace.get("final_results", []) if isinstance(search_trace, dict) else []
+        result_count = len(final_results) if isinstance(final_results, list) else 0
+        domain_filter = planner.get("domain_filter", {}) if isinstance(planner, dict) else {}
+
+        return {
+            "query_hash": query_hash,
+            "query_preview": query_preview,
+            "allow_rag": bool(planner.get("allow_rag", True)) if isinstance(planner, dict) else True,
+            "filter_reason": str(planner.get("filter_reason", "")).strip()
+            if isinstance(planner, dict)
+            else "",
+            "domain_decision": str(domain_filter.get("decision", "")).strip()
+            if isinstance(domain_filter, dict)
+            else "",
+            "domain_reason": str(domain_filter.get("reason", "")).strip()
+            if isinstance(domain_filter, dict)
+            else "",
+            "rag_executed": bool(rag.get("executed", False)) if isinstance(rag, dict) else False,
+            "rag_skip_reason": str(rag.get("skip_reason", "")).strip() if isinstance(rag, dict) else "",
+            "result_count": result_count,
+            "fallback_reason": fallback_reason,
+        }
+
+    def _log_debug_trace(self, *, event_data: dict[str, Any], result: dict[str, Any]) -> None:
+        event = self._extract_event(event_data)
+        message = event.get("message", {}) if isinstance(event, dict) else {}
+        log_payload = {
+            "event_id": str(event_data.get("event_id", "")).strip(),
+            "message_id": str(message.get("message_id", "")).strip() if isinstance(message, dict) else "",
+            "fallback_type": result.get("fallback_type"),
+            "success": bool(result.get("success", False)),
+            "reply_ok": bool(result.get("reply_ok", False)),
+            "reply_error": str(result.get("reply_error", "")).strip(),
+            "debug_trace": result.get("debug_trace"),
+        }
+        logger.info("gateway_debug_trace %s", json.dumps(log_payload, ensure_ascii=False))
 
     @staticmethod
     def _is_placeholder(value: str) -> bool:

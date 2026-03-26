@@ -64,6 +64,9 @@ class SearchConfig:
     vec_top_k: int = 20
     fusion_rrf_k: int = 60
     context_top_k: int = 6
+    domain_filter_enabled: bool = True
+    domain_filter_threshold: float = 0.45
+    domain_filter_fail_open: bool = True
 
 
 @dataclass
@@ -187,6 +190,26 @@ class Config:
             vec_top_k=int(_env("ECBOT_VEC_TOP_K", search_data.get("vec_top_k", 20))),
             fusion_rrf_k=int(_env("ECBOT_FUSION_RRF_K", search_data.get("fusion_rrf_k", 60))),
             context_top_k=int(_env("ECBOT_CONTEXT_TOP_K", search_data.get("context_top_k", 6))),
+            domain_filter_enabled=_as_bool(
+                _env(
+                    "ECBOT_DOMAIN_FILTER_ENABLED",
+                    search_data.get("domain_filter_enabled", True),
+                ),
+                True,
+            ),
+            domain_filter_threshold=float(
+                _env(
+                    "ECBOT_DOMAIN_FILTER_THRESHOLD",
+                    search_data.get("domain_filter_threshold", 0.45),
+                )
+            ),
+            domain_filter_fail_open=_as_bool(
+                _env(
+                    "ECBOT_DOMAIN_FILTER_FAIL_OPEN",
+                    search_data.get("domain_filter_fail_open", True),
+                ),
+                True,
+            ),
         )
         self.database = DatabaseConfig(
             db_path=str(_env("ECBOT_DB_PATH", db_data.get("db_path", "DB/ec_bot.db")))

@@ -56,16 +56,24 @@ class SearchOrchestrator:
     def search_with_trace(self, query: str) -> OrchestratorResult:
         planner_output = self.planner.plan(query)
 
-        rag_hits, rag_trace = self.rag_searcher.search_with_trace(query)
-        hits = [self._to_unified_hit(item) for item in rag_hits]
-        citations = build_grouped_citations(hits)
-        retrieval_confidence = self._compute_confidence(hits)
+        rag_executed = bool(planner_output.allow_rag)
+        rag_trace: dict[str, Any] = {}
+        if rag_executed:
+            rag_hits, rag_trace = self.rag_searcher.search_with_trace(query)
+            hits = [self._to_unified_hit(item) for item in rag_hits]
+            citations = build_grouped_citations(hits)
+            retrieval_confidence = self._compute_confidence(hits)
+        else:
+            hits = []
+            citations = []
+            retrieval_confidence = 0.0
 
         trace_search = self._build_trace(
             query=query,
             planner_output=planner_output,
             rag_trace=rag_trace,
             hits=hits,
+            rag_executed=rag_executed,
         )
         return OrchestratorResult(
             hits=hits,
@@ -81,6 +89,7 @@ class SearchOrchestrator:
         planner_output: PlannerOutput,
         rag_trace: dict[str, Any],
         hits: list[UnifiedSearchHit],
+        rag_executed: bool,
     ) -> dict[str, Any]:
         trace = dict(rag_trace or {})
         trace["query"] = {"text": query}
@@ -89,16 +98,28 @@ class SearchOrchestrator:
             "need_web_search": planner_output.need_web_search,
             "source_route": planner_output.source_route,
             "fusion_strategy": planner_output.fusion_strategy,
+            "allow_rag": planner_output.allow_rag,
+            "filter_reason": planner_output.filter_reason,
+            "domain_relevance_score": planner_output.domain_relevance_score,
+            "domain_filter": dict(planner_output.domain_filter),
             "confidence": planner_output.confidence,
             "reasons": planner_output.reasons,
             "query_expansion": planner_output.query_expansion,
             "retrieval_plan": planner_output.retrieval_plan,
         }
+        trace["rag"] = {
+            "executed": rag_executed,
+            "skip_reason": "" if rag_executed else planner_output.filter_reason,
+        }
         trace["web"] = {
-            "requested": planner_output.need_web_search,
+            "requested": planner_output.allow_rag and planner_output.need_web_search,
             "executed": False,
             "execution_skipped": True,
-            "skip_reason": "web_search_reserved_not_enabled",
+            "skip_reason": (
+                "web_search_reserved_not_enabled"
+                if planner_output.allow_rag
+                else "blocked_by_domain_filter"
+            ),
             "interface": "web_searcher.search_with_trace(query, top_k=...)",
             "fallback_used": False,
             "source_route": planner_output.source_route,

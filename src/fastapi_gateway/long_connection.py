@@ -114,11 +114,18 @@ def run_long_connection_client(config: Config | None = None) -> None:
         event_payload = _to_event_payload(data)
         service.handle_event(event_payload, skip_signature_verification=True)
 
+    def _handle_message_read(_: Any) -> None:
+        # Explicitly consume read-receipt events to avoid "processor not found" noise.
+        return
+
     dispatcher_builder = lark.EventDispatcherHandler.builder(
         cfg.gateway.feishu.verification_token or "",
         cfg.gateway.feishu.encrypt_key or "",
     )
-    dispatcher = dispatcher_builder.register_p2_im_message_receive_v1(_handle_message).build()
+    dispatcher_builder = dispatcher_builder.register_p2_im_message_receive_v1(_handle_message)
+    if hasattr(dispatcher_builder, "register_p2_im_message_read_v1"):
+        dispatcher_builder = dispatcher_builder.register_p2_im_message_read_v1(_handle_message_read)
+    dispatcher = dispatcher_builder.build()
     log_level = _resolve_lark_log_level(lark, cfg.gateway.feishu.long_conn_log_level)
 
     client_builder_cls = getattr(lark.ws.Client, "Builder", None)
