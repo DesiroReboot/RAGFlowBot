@@ -11,6 +11,7 @@ from typing import Any
 from src.config import Config
 from src.RAG.config.kbase_config import KBaseConfig
 from src.RAG.kbase_manager import KBaseManager
+from src.RAG.readiness import is_index_ready, normalize_manifest_status
 from src.RAG.storage.manifest_store import ManifestStore
 from src.RAG.storage.sqlite_conn import connect
 from src.RAG.storage.sqlite_schema import ensure_schema
@@ -120,16 +121,19 @@ class KBaseStartupBootstrap:
     def readiness_snapshot(self) -> dict[str, Any]:
         manifest = self.manifest_store.get_manifest() or {}
         counts = self._read_counts()
-        status = self._manifest_status(manifest)
+        status = normalize_manifest_status(manifest)
+        ready, reason, _status = is_index_ready(manifest, counts)
         empty_index = (
             int(counts.get("indexed_files", 0)) <= 0
             and int(counts.get("indexed_chunks", 0)) <= 0
             and int(counts.get("fts_documents", 0)) <= 0
             and int(counts.get("vec_rows", 0)) <= 0
         )
-        needs_init = bool(status in {"empty", "failed"} or empty_index)
+        needs_init = not bool(ready)
         return {
             "status": status,
+            "ready": bool(ready),
+            "reason": reason,
             "needs_init": needs_init,
             "empty_index": empty_index,
             "manifest": manifest,
@@ -148,7 +152,7 @@ class KBaseStartupBootstrap:
                 readiness = self.readiness_snapshot()
                 return {
                     "attempted": False,
-                    "success": readiness.get("status") in {"ready", "partial"},
+                    "success": bool(readiness.get("ready", False)),
                     "skipped_reason": "lock_already_held",
                     "error": "",
                     "manifest_after": readiness.get("manifest", {}),
@@ -160,7 +164,7 @@ class KBaseStartupBootstrap:
                 manager = KBaseManager(self._build_kbase_config())
                 manager.sync_configured_source()
                 readiness = self.readiness_snapshot()
-                success = str(readiness.get("status")) in {"ready", "partial"}
+                success = bool(readiness.get("ready", False))
                 logger.info(
                     "kb_startup_bootstrap init_done=%s",
                     json.dumps(
@@ -207,7 +211,7 @@ class KBaseStartupBootstrap:
                 {
                     "started": False,
                     "completed": True,
-                    "success": readiness.get("status") in {"ready", "partial"},
+                    "success": bool(readiness.get("ready", False)),
                     "attempted": False,
                     "launched_async": False,
                     "skipped_reason": reason,
@@ -329,12 +333,3 @@ class KBaseStartupBootstrap:
             return int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
         except Exception:
             return 0
-
-    @staticmethod
-    def _manifest_status(manifest: dict[str, Any]) -> str:
-        status = str(manifest.get("status", "")).strip().lower()
-        if status in {"empty", "ready", "partial", "failed"}:
-            return status
-        if manifest:
-            return "ready"
-        return "empty"

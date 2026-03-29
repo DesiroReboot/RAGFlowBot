@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from src.config import Config
 from src.core.generation import GenerationClient
-from src.core.search.orchestrator import SearchOrchestrator
+from src.core.search.orchestrator import SearchOrchestrator, UnifiedSearchHit
 from src.core.search.planner import RulePlanner
 from src.core.search.query_analyzer import QueryAnalysis, QueryAnalyzer
 from src.core.search.rag_search import RAGSearcher, SearchResult
@@ -14,7 +15,17 @@ from src.core.search.source_utils import build_grouped_citations
 from src.core.search.web_result_evaluator import WebResultEvaluator
 from src.core.search.web_router import WebRouter
 from src.core.search.web_search_client import WebSearchClient, WebSearchResult
+from src.core.trace_builder import (
+    GenerationFallbackReason,
+    TraceFallbackReason,
+    build_agent_trace,
+    build_strategy_fallback_step,
+    build_web_trace,
+    merge_reason_codes,
+    normalize_web_trace,
+)
 from src.RAG.config.kbase_config import KBaseConfig
+from src.RAG.readiness import is_index_ready
 from src.RAG.storage.manifest_store import ManifestStore
 
 
@@ -33,6 +44,9 @@ class AnswerDraft:
     steps: list[str]
     evidence: list[str]
     citations: list[dict[str, Any]]
+
+
+SearchHit = SearchResult | UnifiedSearchHit
 
 
 class ReActAgent:
@@ -121,13 +135,39 @@ class ReActAgent:
         except Exception:
             self.answer_top_k = 3
 
+        manifest_gate = self._manifest_gate_snapshot()
+        manifest = manifest_gate.get("manifest", {})
+        if bool(manifest_gate.get("blocked", False)):
+            search_trace: dict[str, Any] = {"manifest_gate": dict(manifest_gate)}
+            self._normalize_web_trace(search_trace)
+            blocked_trace = build_agent_trace(
+                query=query,
+                search_trace=search_trace,
+                manifest=manifest or {},
+            )
+            blocked_trace["strategy_execution"] = [
+                build_strategy_fallback_step(reason=TraceFallbackReason.INDEX_NOT_READY)
+            ]
+            blocked_trace["final_citations"] = []
+            blocked_trace["retrieval_confidence"] = 0.0
+            answer = "Index is not ready yet. Please initialize or sync the knowledge base first."
+            blocked_trace["final_answer_preview"] = answer
+            return AgentResponse(
+                answer=answer,
+                citations=[],
+                retrieval_confidence=0.0,
+                trace=blocked_trace if include_trace else {},
+            )
+
         citations_from_search: list[dict[str, Any]] | None = None
         confidence_from_search = 0.0
+        results: list[SearchHit] = []
+        search_trace = {}
         if hasattr(self, "search_orchestrator") and self.search_orchestrator is not None:
             if hasattr(self.search_orchestrator, "answer_top_k"):
                 self.search_orchestrator.answer_top_k = self.answer_top_k
             orchestrator_result = self.search_orchestrator.search_with_trace(query)
-            results = list(orchestrator_result.hits)
+            results = self._coerce_search_hits(orchestrator_result.hits)
             search_trace = (
                 orchestrator_result.trace_search if isinstance(orchestrator_result.trace_search, dict) else {}
             )
@@ -137,10 +177,12 @@ class ReActAgent:
             confidence_from_search = float(getattr(orchestrator_result, "retrieval_confidence", 0.0) or 0.0)
         else:
             searcher = getattr(self, "searcher", None) or self.rag_searcher
-            results, search_trace = searcher.search_with_trace(query)
+            rag_results, search_trace = searcher.search_with_trace(query)
+            results = self._coerce_search_hits(rag_results)
 
         if not isinstance(search_trace, dict):
             search_trace = {}
+        search_trace["manifest_gate"] = dict(manifest_gate)
 
         if not (hasattr(self, "search_orchestrator") and self.search_orchestrator is not None):
             # Legacy execution path kept for compatibility when orchestrator is not injected.
@@ -165,19 +207,19 @@ class ReActAgent:
             else:
                 query_analysis.reasons.append("query_analyzer_unavailable")
 
-            web_trace: dict[str, Any] = {
-                "need_web_search": bool(query_analysis.need_web_search),
-                "fusion_strategy": "none",
-                "reasons": list(query_analysis.reasons),
-                "metrics": {
+            web_trace = build_web_trace(
+                requested=bool(query_analysis.need_web_search),
+                route_mode="legacy",
+                need_web_search=bool(query_analysis.need_web_search),
+                reasons=list(query_analysis.reasons),
+                metrics={
                     "temporal_intent_score": float(query_analysis.temporal_intent_score),
                     "domain_relevance_score": float(query_analysis.domain_relevance_score),
                     "oov_entity_score": float(query_analysis.oov_entity_score),
                     "kb_coverage_score": float(query_analysis.kb_coverage_score),
                     "kb_result_count": len(results),
                 },
-                "fallback_used": False,
-            }
+            )
             web_routing_ready = (
                 hasattr(self, "config")
                 and hasattr(getattr(self, "config"), "search")
@@ -196,28 +238,18 @@ class ReActAgent:
                     web_trace["fallback_used"] = True
                     web_trace["reasons"] = self._merge_reasons(
                         list(web_trace.get("reasons", [])),
-                        ["web_routing_error"],
+                        [TraceFallbackReason.WEB_ROUTING_ERROR.value],
                     )
                     web_trace["error"] = str(exc)
             else:
                 web_trace["reasons"] = self._merge_reasons(
                     list(web_trace.get("reasons", [])),
-                    ["web_routing_unavailable"],
+                    [TraceFallbackReason.WEB_ROUTING_UNAVAILABLE.value],
                 )
             search_trace["web"] = web_trace
 
         self._normalize_web_trace(search_trace)
-        manifest_store = getattr(self, "manifest_store", None)
-        if manifest_store is not None and hasattr(manifest_store, "get_manifest"):
-            manifest = manifest_store.get_manifest()
-        else:
-            manifest = {}
-        trace: dict[str, Any] = {
-            "query": query,
-            "search": search_trace,
-            "strategy_execution": [],
-            "manifest": manifest or {},
-        }
+        trace = build_agent_trace(query=query, search_trace=search_trace, manifest=manifest or {})
 
         if not results:
             planner_trace = search_trace.get("planner", {}) if isinstance(search_trace, dict) else {}
@@ -225,24 +257,24 @@ class ReActAgent:
             filter_reason = str(planner_trace.get("filter_reason", "")).strip()
 
             if not allow_rag:
-                reason = "domain_out_of_scope"
+                reason = TraceFallbackReason.DOMAIN_OUT_OF_SCOPE.value
                 answer = (
                     "当前问题不在外贸/跨境电商知识域内，已跳过知识库检索。"
                     "请改问选品、Listing、广告投放、物流、关税、平台运营等相关问题。"
                 )
             else:
-                reason = "index_not_ready" if not manifest else "no_retrieval_results"
+                reason = (
+                    TraceFallbackReason.INDEX_NOT_READY.value
+                    if bool(manifest_gate.get("blocked", False))
+                    else TraceFallbackReason.NO_RETRIEVAL_RESULTS.value
+                )
                 answer = (
                     "当前索引尚未就绪，请先执行离线知识库同步。"
-                    if reason == "index_not_ready"
+                    if reason == TraceFallbackReason.INDEX_NOT_READY.value
                     else "未从知识库检索到足够相关内容，请补充更具体的问题后重试。"
                 )
             trace["strategy_execution"].append(
-                {
-                    "stage": "fallback_answer",
-                    "reason": reason,
-                    "filter_reason": filter_reason,
-                }
+                build_strategy_fallback_step(reason=reason, filter_reason=filter_reason)
             )
             trace["final_answer_preview"] = answer
             trace["final_citations"] = []
@@ -292,37 +324,73 @@ class ReActAgent:
             trace=trace if include_trace else {},
         )
 
+    def _manifest_gate_snapshot(self) -> dict[str, Any]:
+        manifest_store = getattr(self, "manifest_store", None)
+        if manifest_store is None or not hasattr(manifest_store, "get_manifest"):
+            return {
+                "ready": True,
+                "blocked": False,
+                "status": "unknown",
+                "reason": "manifest_store_unavailable",
+                "manifest": {},
+            }
+
+        try:
+            raw_manifest = manifest_store.get_manifest()
+        except Exception:
+            return {
+                "ready": True,
+                "blocked": False,
+                "status": "unknown",
+                "reason": "manifest_read_error",
+                "manifest": {},
+            }
+
+        manifest = raw_manifest if isinstance(raw_manifest, dict) else {}
+        ready, reason, status = is_index_ready(manifest)
+        return {
+            "ready": bool(ready),
+            "blocked": not bool(ready),
+            "status": status,
+            "reason": reason,
+            "manifest": manifest,
+        }
+
     def _apply_web_routing(
         self,
         *,
         query: str,
-        local_results: list[SearchResult],
+        local_results: list[SearchHit],
         query_analysis: QueryAnalysis,
-    ) -> tuple[list[Any], dict[str, Any]]:
+    ) -> tuple[list[SearchHit], dict[str, Any]]:
         enabled = bool(self.config.search.web_search_enabled)
         kb_empty = len(local_results) == 0
         need_web_search = bool(query_analysis.need_web_search) or kb_empty
         reasons = [str(reason) for reason in query_analysis.reasons if str(reason).strip()]
         if kb_empty:
             reasons = self._merge_reasons(reasons, ["kb_empty_triggered_web_fallback"])
-        web_trace: dict[str, Any] = {
-            "need_web_search": need_web_search,
-            "fusion_strategy": "none",
-            "reasons": list(reasons),
-            "metrics": {
+        web_trace = build_web_trace(
+            requested=need_web_search,
+            route_mode="legacy",
+            need_web_search=need_web_search,
+            reasons=list(reasons),
+            metrics={
                 "temporal_intent_score": float(query_analysis.temporal_intent_score),
                 "domain_relevance_score": float(query_analysis.domain_relevance_score),
                 "oov_entity_score": float(query_analysis.oov_entity_score),
                 "kb_coverage_score": float(query_analysis.kb_coverage_score),
                 "kb_result_count": len(local_results),
             },
-            "fallback_used": False,
-        }
+        )
         if not enabled:
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_search_disabled"])
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.WEB_SEARCH_DISABLED.value]
+            )
             return local_results, web_trace
         if not need_web_search:
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_not_required"])
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.WEB_NOT_REQUIRED.value]
+            )
             return local_results, web_trace
 
         try:
@@ -333,9 +401,9 @@ class ReActAgent:
         except Exception as exc:
             web_trace["fallback_used"] = True
             error_text = str(exc)
-            error_reasons = ["web_search_error"]
-            if "provider_misconfigured" in error_text:
-                error_reasons.append("provider_misconfigured")
+            error_reasons = [TraceFallbackReason.WEB_SEARCH_ERROR.value]
+            if TraceFallbackReason.PROVIDER_MISCONFIGURED.value in error_text:
+                error_reasons.append(TraceFallbackReason.PROVIDER_MISCONFIGURED.value)
             web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], error_reasons)
             web_trace["error"] = error_text
             return local_results, web_trace
@@ -344,7 +412,9 @@ class ReActAgent:
         web_trace["metrics"]["result_count_raw"] = len(web_results)
         if not web_results:
             web_trace["fallback_used"] = True
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_no_results"])
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.WEB_NO_RESULTS.value]
+            )
             return local_results, web_trace
 
         evaluation = self.web_result_evaluator.evaluate(query=query, results=web_results)
@@ -367,7 +437,9 @@ class ReActAgent:
             if fused:
                 return fused, web_trace
             web_trace["fallback_used"] = True
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["direct_fusion_empty"])
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.DIRECT_FUSION_EMPTY.value]
+            )
             return local_results, web_trace
 
         if decision.fusion_strategy == "rag_fusion":
@@ -379,7 +451,9 @@ class ReActAgent:
             if fused:
                 return fused, web_trace
             web_trace["fallback_used"] = True
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["rag_fusion_empty"])
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.RAG_FUSION_EMPTY.value]
+            )
             return local_results, web_trace
 
         web_trace["fallback_used"] = True
@@ -389,9 +463,9 @@ class ReActAgent:
         self,
         *,
         query: str,
-        local_results: list[Any],
+        local_results: list[SearchHit],
         web_results: list[WebSearchResult],
-    ) -> list[Any]:
+    ) -> list[SearchHit]:
         limit = max(self.answer_top_k * 3, self.answer_top_k)
         web_limit = min(int(self.config.search.web_rag_max_docs), 8)
         web_rows = self._convert_web_results(query=query, web_results=web_results[:web_limit])
@@ -402,15 +476,15 @@ class ReActAgent:
         self,
         *,
         query: str,
-        local_results: list[Any],
+        local_results: list[SearchHit],
         web_results: list[WebSearchResult],
-    ) -> list[Any]:
+    ) -> list[SearchHit]:
         web_rows = self._convert_web_results(
             query=query,
             web_results=web_results[: int(self.config.search.web_rag_max_docs)],
         )
         query_terms = set(self._query_terms(query))
-        scored_rows: list[tuple[float, Any]] = []
+        scored_rows: list[tuple[float, SearchHit]] = []
         for row in list(local_results) + web_rows:
             base_score = max(0.0, float(getattr(row, "score", 0.0)))
             content = str(getattr(row, "content", "")).lower()
@@ -434,9 +508,9 @@ class ReActAgent:
         *,
         query: str,
         web_results: list[WebSearchResult],
-    ) -> list[Any]:
+    ) -> list[SearchHit]:
         query_terms = set(self._query_terms(query))
-        converted: list[Any] = []
+        converted: list[SearchHit] = []
         for index, row in enumerate(web_results, start=1):
             text = f"{row.title} {row.snippet}".strip()
             if query_terms:
@@ -489,8 +563,8 @@ class ReActAgent:
             section_title=section_title,
         )
 
-    def _dedupe_results(self, rows: list[Any], *, limit: int) -> list[Any]:
-        deduped: list[Any] = []
+    def _dedupe_results(self, rows: list[SearchHit], *, limit: int) -> list[SearchHit]:
+        deduped: list[SearchHit] = []
         seen: set[str] = set()
         for row in rows:
             source = str(getattr(row, "source", "")).strip().lower()
@@ -505,38 +579,15 @@ class ReActAgent:
                 break
         return deduped
 
+    @staticmethod
+    def _coerce_search_hits(rows: Iterable[SearchHit]) -> list[SearchHit]:
+        return [row for row in rows]
+
     def _merge_reasons(self, left: list[str], right: list[str]) -> list[str]:
-        merged = [str(item) for item in left if str(item).strip()]
-        seen = set(merged)
-        for item in right:
-            text = str(item).strip()
-            if not text or text in seen:
-                continue
-            merged.append(text)
-            seen.add(text)
-        return merged
+        return merge_reason_codes(left, right)
 
     def _normalize_web_trace(self, search_trace: dict[str, Any]) -> None:
-        web_trace = search_trace.get("web")
-        if not isinstance(web_trace, dict):
-            web_trace = {}
-            search_trace["web"] = web_trace
-
-        if "fallback_used" in web_trace:
-            web_trace["fallback_used"] = bool(web_trace.get("fallback_used"))
-            return
-
-        if "fallback" in web_trace:
-            web_trace["fallback_used"] = bool(web_trace.get("fallback"))
-            compat = search_trace.get("compat")
-            if not isinstance(compat, dict):
-                compat = {}
-                search_trace["compat"] = compat
-            if not compat.get("trace_web_fallback_legacy_read"):
-                compat["trace_web_fallback_legacy_read"] = True
-            return
-
-        web_trace["fallback_used"] = False
+        normalize_web_trace(search_trace)
 
     def _build_citations(self, selected: list[Any]) -> list[dict[str, Any]]:
         return build_grouped_citations(selected)
@@ -590,7 +641,7 @@ class ReActAgent:
         try:
             rewritten = self._hybrid_rewrite(draft=draft, template_answer=template_answer)
         except Exception as exc:
-            generation_meta["fallback_reason"] = "hybrid_unavailable_or_error"
+            generation_meta["fallback_reason"] = GenerationFallbackReason.HYBRID_UNAVAILABLE_OR_ERROR.value
             generation_meta["error"] = str(exc)
             return template_answer, generation_meta
 
@@ -605,13 +656,13 @@ class ReActAgent:
             generation_meta["quality_issues"] = quality_issues
 
         if quality_score < float(self.config.generation.min_quality_score):
-            generation_meta["fallback_reason"] = "quality_below_threshold"
+            generation_meta["fallback_reason"] = GenerationFallbackReason.QUALITY_BELOW_THRESHOLD.value
             return template_answer, generation_meta
         if claim_support_rate < float(self.config.generation.min_claim_support_rate):
-            generation_meta["fallback_reason"] = "claim_support_below_threshold"
+            generation_meta["fallback_reason"] = GenerationFallbackReason.CLAIM_SUPPORT_BELOW_THRESHOLD.value
             return template_answer, generation_meta
         if citation_coverage < float(self.config.generation.min_citation_coverage):
-            generation_meta["fallback_reason"] = "citation_coverage_below_threshold"
+            generation_meta["fallback_reason"] = GenerationFallbackReason.CITATION_COVERAGE_BELOW_THRESHOLD.value
             return template_answer, generation_meta
 
         generation_meta["final_mode"] = "hybrid"
@@ -623,26 +674,26 @@ class ReActAgent:
         has_fts = isinstance(fts_recall, list) and bool(fts_recall)
         has_vec = isinstance(vec_recall, list) and bool(vec_recall)
         if "fts_recall" in search_trace and not has_fts and not has_vec:
-            return "fts_no_hit"
+            return GenerationFallbackReason.FTS_NO_HIT.value
 
         generation_trace = search_trace.get("generation", {})
         if isinstance(generation_trace, dict):
             if generation_trace.get("error"):
-                return "search_generation_error"
+                return GenerationFallbackReason.SEARCH_GENERATION_ERROR.value
             branch_errors = generation_trace.get("branch_errors", {})
             selected_count = int(generation_trace.get("selected_count", 0) or 0)
             if selected_count <= 0 and not (has_fts or has_vec):
-                return "no_retrieval_results"
+                return GenerationFallbackReason.NO_RETRIEVAL_RESULTS.value
             if isinstance(branch_errors, dict) and branch_errors:
                 # Keep generation enabled when at least one retrieval branch is healthy.
                 if "vec" in branch_errors and not has_fts:
-                    return "vector_branch_error_no_lexical_backup"
+                    return GenerationFallbackReason.VECTOR_BRANCH_ERROR_NO_LEXICAL_BACKUP.value
                 if "fts" in branch_errors and not has_vec:
-                    return "fts_branch_error_no_vector_backup"
+                    return GenerationFallbackReason.FTS_BRANCH_ERROR_NO_VECTOR_BACKUP.value
 
         errors = search_trace.get("errors", [])
         if isinstance(errors, list) and errors and not (has_fts or has_vec):
-            return "search_error"
+            return GenerationFallbackReason.SEARCH_ERROR.value
         return ""
 
     def _hybrid_rewrite(self, *, draft: AnswerDraft, template_answer: str) -> str:

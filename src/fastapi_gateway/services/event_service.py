@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
@@ -12,6 +13,7 @@ from typing import Any
 from src.config import Config
 from src.core.bot_agent import ReActAgent
 from src.core.search.query_preprocessor import QueryPreprocessor
+from src.core.trace_builder import build_debug_trace, extract_first_strategy_reason
 from src.fastapi_gateway.security.verifier import FeishuAuthVerifier
 from src.fastapi_gateway.services.feishu_client import FeishuAPIClient
 
@@ -27,6 +29,9 @@ class GatewayResult:
     debug_trace: dict[str, Any] | None = None
 
 
+EventHandler = Callable[[dict[str, Any]], dict[str, Any]]
+
+
 class FeishuEventService:
     _SEARCH_PROGRESS_MARKERS: tuple[str, ...] = (
         "latest",
@@ -34,6 +39,12 @@ class FeishuEventService:
         "today",
         "this year",
         "this month",
+        "最近",
+        "最新",
+        "近期",
+        "本周",
+        "本月",
+        "今年",
     )
 
     def __init__(self, config: Config):
@@ -45,6 +56,10 @@ class FeishuEventService:
         self._dedup_max_entries = 2048
         self._processed_event_keys: dict[str, float] = {}
         self._dedup_lock = Lock()
+        self._event_handlers: dict[str, EventHandler] = {
+            "url_verification": self._handle_url_verification_event,
+            "event_callback": self._handle_event_callback,
+        }
 
     def validate_startup(self) -> dict[str, Any]:
         feishu_cfg = self.config.gateway.feishu
@@ -208,28 +223,31 @@ class FeishuEventService:
             raw_body=raw_body,
             encrypt_key=feishu_cfg.encrypt_key,
         ):
-            return {
-                "success": False,
-                "message": self._fallback_message("signature_invalid"),
-                "fallback_type": "signature_invalid",
-                "timestamp": datetime.now(UTC).isoformat(),
-            }
+            return self._build_error_payload("signature_invalid")
 
-        event_type = event_data.get("type")
-        if event_type == "url_verification":
-            if not FeishuAuthVerifier.verify_verification_token(
-                event_data,
-                feishu_cfg.verification_token,
-            ):
-                return {
-                    "success": False,
-                    "message": self._fallback_message("verification_token_invalid"),
-                    "fallback_type": "verification_token_invalid",
-                    "timestamp": datetime.now(UTC).isoformat(),
-                }
-            return {"challenge": event_data.get("challenge", "")}
+        handler = self._resolve_event_handler(event_data)
+        return handler(event_data)
 
-        return self._handle_event_callback(event_data)
+    def _resolve_event_handler(self, event_data: dict[str, Any]) -> EventHandler:
+        event_type = str(event_data.get("type", "")).strip()
+        return self._event_handlers.get(event_type, self._handle_event_callback)
+
+    def _handle_url_verification_event(self, event_data: dict[str, Any]) -> dict[str, Any]:
+        if not FeishuAuthVerifier.verify_verification_token(
+            event_data,
+            self.config.gateway.feishu.verification_token,
+        ):
+            return self._build_error_payload("verification_token_invalid")
+        return {"challenge": event_data.get("challenge", "")}
+
+    @staticmethod
+    def _build_error_payload(fallback_type: str) -> dict[str, Any]:
+        return {
+            "success": False,
+            "message": FeishuEventService._fallback_message(fallback_type),
+            "fallback_type": fallback_type,
+            "timestamp": datetime.now(UTC).isoformat(),
+        }
 
     def _handle_event_callback(self, event_data: dict[str, Any]) -> dict[str, Any]:
         dedup_key = self._event_dedup_key(event_data)
@@ -255,20 +273,44 @@ class FeishuEventService:
             }
 
         query = self._extract_query(event_data)
-        if not query.strip():
-            result = GatewayResult(
-                success=False,
-                message=self._fallback_message("invalid_input"),
-                fallback_type="error",
-            )
-            progress_reply_result = {"ok": False, "error": "query_empty", "data": {}}
-        else:
-            progress_reply_result = self._try_send_progress_reply(event_data=event_data, query=query)
-            result = self._process_query(query)
+        result, progress_reply_result = self._run_query_flow(event_data=event_data, query=query)
 
         reply_result = self._reply_to_event(event_data=event_data, text=result.message)
+        payload = self._build_callback_payload(
+            result=result,
+            reply_result=reply_result,
+            progress_reply_result=progress_reply_result,
+        )
+        self._log_debug_trace(event_data=event_data, result=payload)
+        return payload
+
+    def _run_query_flow(
+        self,
+        *,
+        event_data: dict[str, Any],
+        query: str,
+    ) -> tuple[GatewayResult, dict[str, Any]]:
+        if not query.strip():
+            return (
+                GatewayResult(
+                    success=False,
+                    message=self._fallback_message("invalid_input"),
+                    fallback_type="error",
+                ),
+                {"ok": False, "error": "query_empty", "data": {}},
+            )
+        progress_reply_result = self._try_send_progress_reply(event_data=event_data, query=query)
+        return self._process_query(query), progress_reply_result
+
+    def _build_callback_payload(
+        self,
+        *,
+        result: GatewayResult,
+        reply_result: dict[str, Any],
+        progress_reply_result: dict[str, Any],
+    ) -> dict[str, Any]:
         token_dialog = self.api_client.token_dialog_payload()
-        payload = {
+        return {
             "success": result.success,
             "message": result.message,
             "fallback_type": result.fallback_type,
@@ -281,8 +323,6 @@ class FeishuEventService:
             "debug_trace": result.debug_trace,
             "timestamp": datetime.now(UTC).isoformat(),
         }
-        self._log_debug_trace(event_data=event_data, result=payload)
-        return payload
 
     def _extract_query(self, event_data: dict[str, Any]) -> str:
         event = self._extract_event(event_data)
@@ -348,8 +388,6 @@ class FeishuEventService:
             return {"ok": False, "error": f"progress_send_error:{exc}", "data": {}}
 
     def _should_send_search_progress(self, query: str) -> bool:
-        if not bool(self.config.search.web_search_enabled):
-            return False
         if not bool(self.config.search.search_progress_enabled):
             return False
         lowered = str(query or "").strip().lower()
@@ -359,10 +397,12 @@ class FeishuEventService:
             return True
         processed = self.query_preprocessor.process(query)
         intent = processed.get("query_intent", {})
+        if isinstance(intent, dict) and bool(intent.get("need_web_search", False)):
+            return True
         temporal_terms = intent.get("temporal_terms", []) if isinstance(intent, dict) else []
         if isinstance(temporal_terms, list) and any(str(item).strip() for item in temporal_terms):
             return True
-        return any(hint in lowered for hint in ("最近", "最新", "近期", "本周", "本月", "今年"))
+        return False
 
     def _build_search_progress_text(self, query: str) -> str:
         top_k = max(1, int(self.config.search.search_progress_keyword_top_k))
@@ -495,29 +535,27 @@ class FeishuEventService:
         search_trace = trace.get("search", {}) if isinstance(trace, dict) else {}
         planner = search_trace.get("planner", {}) if isinstance(search_trace, dict) else {}
         rag = search_trace.get("rag", {}) if isinstance(search_trace, dict) else {}
-        strategy_execution = (
-            trace.get("strategy_execution", []) if isinstance(trace, dict) else []
-        )
-        fallback_reason = ""
-        if isinstance(strategy_execution, list) and strategy_execution:
-            first = strategy_execution[0]
-            if isinstance(first, dict):
-                fallback_reason = str(first.get("reason", "")).strip()
+        fallback_reason = extract_first_strategy_reason(trace)
 
         query_hash = hashlib.md5(str(query or "").encode("utf-8")).hexdigest()[:10]
         query_preview = str(query or "").strip().replace("\n", " ")[:40]
         final_results = search_trace.get("final_results", []) if isinstance(search_trace, dict) else []
         result_count = len(final_results) if isinstance(final_results, list) else 0
-        return {
-            "query_hash": query_hash,
-            "query_preview": query_preview,
-            "allow_rag": True,
-            "filter_reason": "",
-            "rag_executed": bool(rag.get("executed", False)) if isinstance(rag, dict) else False,
-            "rag_skip_reason": str(rag.get("skip_reason", "")).strip() if isinstance(rag, dict) else "",
-            "result_count": result_count,
-            "fallback_reason": fallback_reason,
-        }
+        allow_rag = True
+        filter_reason = ""
+        if isinstance(planner, dict):
+            allow_rag = bool(planner.get("allow_rag", True))
+            filter_reason = str(planner.get("filter_reason", "")).strip()
+        return build_debug_trace(
+            query_hash=query_hash,
+            query_preview=query_preview,
+            allow_rag=allow_rag,
+            filter_reason=filter_reason,
+            rag_executed=bool(rag.get("executed", False)) if isinstance(rag, dict) else False,
+            rag_skip_reason=str(rag.get("skip_reason", "")).strip() if isinstance(rag, dict) else "",
+            result_count=result_count,
+            fallback_reason=fallback_reason,
+        )
 
     def _log_debug_trace(self, *, event_data: dict[str, Any], result: dict[str, Any]) -> None:
         event = self._extract_event(event_data)

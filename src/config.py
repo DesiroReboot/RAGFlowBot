@@ -126,6 +126,12 @@ class SearchConfig:
     )
     web_rag_max_docs: int = 16
     phase_a_rag_confidence_threshold: float = 0.58
+    merge_web_trigger_requires_rag_gap: bool = True
+    merge_trigger_on_kb_empty: bool = True
+    merge_trigger_on_low_confidence: bool = True
+    merge_step_min_evidence: int = 1
+    merge_evidence_rag_top_k: int = 3
+    merge_evidence_search_top_k: int = 2
     search_progress_enabled: bool = True
     search_progress_keyword_top_k: int = 4
 
@@ -167,6 +173,9 @@ class KnowledgeBaseConfig:
     source_dir: str = r"E:\DATA\外贸电商知识库"
     supported_extensions: tuple[str, ...] = (".md", ".txt", ".pdf")
     auto_sync_on_startup: bool = False
+    auto_init_on_startup: bool = False
+    init_blocking: bool = False
+    init_fail_open: bool = True
     ocr_enabled: bool = True
     ocr_language: str = "chi_sim+eng"
     ocr_dpi_scale: float = 2.0
@@ -257,6 +266,90 @@ class Config:
             ),
             web_threshold_defaults,
         )
+        merge_web_trigger_requires_rag_gap = _as_bool(
+            _env(
+                "ECBOT_MERGE_WEB_TRIGGER_REQUIRES_RAG_GAP",
+                search_data.get(
+                    "merge_web_trigger_requires_rag_gap",
+                    search_data.get("web_trigger_requires_rag_gap", True),
+                ),
+            ),
+            True,
+        )
+        merge_trigger_on_kb_empty = _as_bool(
+            _env(
+                "ECBOT_MERGE_TRIGGER_ON_KB_EMPTY",
+                search_data.get(
+                    "merge_trigger_on_kb_empty",
+                    search_data.get("trigger_on_kb_empty", True),
+                ),
+            ),
+            True,
+        )
+        merge_trigger_on_low_confidence = _as_bool(
+            _env(
+                "ECBOT_MERGE_TRIGGER_ON_LOW_CONFIDENCE",
+                search_data.get(
+                    "merge_trigger_on_low_confidence",
+                    search_data.get("trigger_on_low_confidence", True),
+                ),
+            ),
+            True,
+        )
+        merge_step_min_evidence = int(
+            _env(
+                "ECBOT_MERGE_STEP_MIN_EVIDENCE",
+                search_data.get(
+                    "merge_step_min_evidence",
+                    search_data.get("step_min_evidence", 1),
+                ),
+            )
+        )
+        merge_evidence_rag_top_k = int(
+            _env(
+                "ECBOT_MERGE_EVIDENCE_RAG_TOP_K",
+                search_data.get(
+                    "merge_evidence_rag_top_k",
+                    search_data.get("evidence_rag_top_k", 3),
+                ),
+            )
+        )
+        merge_evidence_search_top_k = int(
+            _env(
+                "ECBOT_MERGE_EVIDENCE_SEARCH_TOP_K",
+                search_data.get(
+                    "merge_evidence_search_top_k",
+                    search_data.get("evidence_search_top_k", 2),
+                ),
+            )
+        )
+        kb_auto_startup = _as_bool(
+            _env(
+                "ECBOT_KB_AUTO_INIT_ON_STARTUP",
+                _env(
+                    "ECBOT_KB_AUTO_SYNC",
+                    knowledge_base_data.get(
+                        "auto_init_on_startup",
+                        knowledge_base_data.get("auto_sync_on_startup", False),
+                    ),
+                ),
+            ),
+            False,
+        )
+        kb_init_blocking = _as_bool(
+            _env(
+                "ECBOT_KB_INIT_BLOCKING",
+                knowledge_base_data.get("init_blocking", False),
+            ),
+            False,
+        )
+        kb_init_fail_open = _as_bool(
+            _env(
+                "ECBOT_KB_INIT_FAIL_OPEN",
+                knowledge_base_data.get("init_fail_open", True),
+            ),
+            True,
+        )
 
         self.search = SearchConfig(
             rag_top_k=int(_env("ECBOT_RAG_TOP_K", search_data.get("rag_top_k", 5))),
@@ -331,6 +424,12 @@ class Config:
                     search_data.get("phase_a_rag_confidence_threshold", 0.58),
                 )
             ),
+            merge_web_trigger_requires_rag_gap=merge_web_trigger_requires_rag_gap,
+            merge_trigger_on_kb_empty=merge_trigger_on_kb_empty,
+            merge_trigger_on_low_confidence=merge_trigger_on_low_confidence,
+            merge_step_min_evidence=merge_step_min_evidence,
+            merge_evidence_rag_top_k=merge_evidence_rag_top_k,
+            merge_evidence_search_top_k=merge_evidence_search_top_k,
             search_progress_enabled=_as_bool(
                 _env(
                     "ECBOT_SEARCH_PROGRESS_ENABLED",
@@ -402,10 +501,10 @@ class Config:
                 knowledge_base_data.get("supported_extensions"),
                 (".md", ".txt", ".pdf"),
             ),
-            auto_sync_on_startup=_as_bool(
-                _env("ECBOT_KB_AUTO_SYNC", knowledge_base_data.get("auto_sync_on_startup", False)),
-                False,
-            ),
+            auto_sync_on_startup=kb_auto_startup,
+            auto_init_on_startup=kb_auto_startup,
+            init_blocking=kb_init_blocking,
+            init_fail_open=kb_init_fail_open,
             ocr_enabled=_as_bool(
                 _env("ECBOT_KB_OCR_ENABLED", knowledge_base_data.get("ocr_enabled", True)),
                 True,

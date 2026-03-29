@@ -11,6 +11,12 @@ from src.core.search.query_analyzer import QueryAnalysis
 from src.core.search.rag_search import SearchResult
 from src.core.search.source_utils import build_grouped_citations
 from src.core.search.web_search_client import WebSearchResult
+from src.core.trace_builder import (
+    TraceFallbackReason,
+    build_orchestrator_trace,
+    build_web_trace,
+    merge_reason_codes,
+)
 
 
 @dataclass
@@ -50,6 +56,29 @@ class WebSearcher(Protocol):
         ...
 
 
+class WebRouteDecisionProtocol(Protocol):
+    fusion_strategy: str
+    reasons: list[str]
+    metrics: dict[str, Any]
+    fallback: bool
+
+
+class WebResultEvaluatorProtocol(Protocol):
+    def evaluate(self, *, query: str, results: list[WebSearchResult]) -> Any:
+        ...
+
+
+class WebRouterProtocol(Protocol):
+    def route(
+        self,
+        *,
+        query: str,
+        analysis: QueryAnalysis,
+        evaluation: Any,
+    ) -> WebRouteDecisionProtocol:
+        ...
+
+
 class SearchOrchestrator:
     def __init__(
         self,
@@ -59,8 +88,8 @@ class SearchOrchestrator:
         web_searcher: WebSearcher | None,
         config: Any,
         query_analyzer: QueryAnalyzerProtocol | None = None,
-        web_result_evaluator: Any | None = None,
-        web_router: Any | None = None,
+        web_result_evaluator: WebResultEvaluatorProtocol | None = None,
+        web_router: WebRouterProtocol | None = None,
         answer_top_k: int = 3,
     ) -> None:
         self.planner = planner
@@ -176,19 +205,15 @@ class SearchOrchestrator:
             if route_mode == "kb_only":
                 route_mode = "hybrid"
 
-        web_trace: dict[str, Any] = {
-            "requested": bool(need_web_search),
-            "executed": False,
-            "execution_skipped": False,
-            "skip_reason": "",
-            "source_route": planner_output.source_route,
-            "route_mode": str(getattr(planner_output, "route_mode", "serial") or "serial"),
-            "fusion_strategy": "none",
-            "need_web_search": need_web_search,
-            "phase": "A",
-            "reasons": list(reasons),
-            "route_mode_from_analysis": route_mode,
-            "metrics": {
+        web_trace = build_web_trace(
+            requested=need_web_search,
+            source_route=planner_output.source_route,
+            route_mode=str(getattr(planner_output, "route_mode", "serial") or "serial"),
+            need_web_search=need_web_search,
+            phase="A",
+            reasons=list(reasons),
+            route_mode_from_analysis=route_mode,
+            metrics={
                 "temporal_intent_score": float(query_analysis.temporal_intent_score),
                 "domain_relevance_score": float(query_analysis.domain_relevance_score),
                 "oov_entity_score": float(query_analysis.oov_entity_score),
@@ -197,25 +222,30 @@ class SearchOrchestrator:
                 "phase_a_rag_confidence_threshold": phase_a_threshold,
                 "kb_result_count": len(local_hits),
             },
-            "fallback_used": False,
-        }
+        )
 
         if not self._web_routing_ready():
             web_trace["execution_skipped"] = True
-            web_trace["skip_reason"] = "web_routing_unavailable"
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_routing_unavailable"])
+            web_trace["skip_reason"] = TraceFallbackReason.WEB_ROUTING_UNAVAILABLE.value
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.WEB_ROUTING_UNAVAILABLE.value]
+            )
             return local_hits, web_trace
 
         if not bool(getattr(self.config.search, "web_search_enabled", False)):
             web_trace["execution_skipped"] = True
-            web_trace["skip_reason"] = "web_search_disabled"
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_search_disabled"])
+            web_trace["skip_reason"] = TraceFallbackReason.WEB_SEARCH_DISABLED.value
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.WEB_SEARCH_DISABLED.value]
+            )
             return local_hits, web_trace
 
         if not need_web_search:
             web_trace["execution_skipped"] = True
-            web_trace["skip_reason"] = "web_not_required"
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_not_required"])
+            web_trace["skip_reason"] = TraceFallbackReason.WEB_NOT_REQUIRED.value
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.WEB_NOT_REQUIRED.value]
+            )
             return local_hits, web_trace
 
         try:
@@ -226,9 +256,9 @@ class SearchOrchestrator:
             web_trace["executed"] = True
         except Exception as exc:
             error_text = str(exc)
-            error_reasons = ["web_search_error"]
-            if "provider_misconfigured" in error_text:
-                error_reasons.append("provider_misconfigured")
+            error_reasons = [TraceFallbackReason.WEB_SEARCH_ERROR.value]
+            if TraceFallbackReason.PROVIDER_MISCONFIGURED.value in error_text:
+                error_reasons.append(TraceFallbackReason.PROVIDER_MISCONFIGURED.value)
             web_trace["fallback_used"] = True
             web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], error_reasons)
             web_trace["error"] = error_text
@@ -238,11 +268,24 @@ class SearchOrchestrator:
         web_trace["metrics"]["result_count_raw"] = len(web_results)
         if not web_results:
             web_trace["fallback_used"] = True
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["web_no_results"])
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.WEB_NO_RESULTS.value]
+            )
             return local_hits, web_trace
 
-        evaluation = self.web_result_evaluator.evaluate(query=query, results=web_results)
-        decision = self.web_router.route(
+        evaluator = self.web_result_evaluator
+        router = self.web_router
+        if evaluator is None or router is None:
+            web_trace["execution_skipped"] = True
+            web_trace["skip_reason"] = TraceFallbackReason.WEB_ROUTING_UNAVAILABLE.value
+            web_trace["fallback_used"] = True
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.WEB_ROUTING_UNAVAILABLE.value]
+            )
+            return local_hits, web_trace
+
+        evaluation = evaluator.evaluate(query=query, results=web_results)
+        decision = router.route(
             query=query,
             analysis=query_analysis,
             evaluation=evaluation,
@@ -264,7 +307,9 @@ class SearchOrchestrator:
             if fused:
                 return fused, web_trace
             web_trace["fallback_used"] = True
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["direct_fusion_empty"])
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.DIRECT_FUSION_EMPTY.value]
+            )
             return local_hits, web_trace
 
         if decision.fusion_strategy == "rag_fusion":
@@ -279,7 +324,9 @@ class SearchOrchestrator:
             if fused:
                 return fused, web_trace
             web_trace["fallback_used"] = True
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], ["rag_fusion_empty"])
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], [TraceFallbackReason.RAG_FUSION_EMPTY.value]
+            )
             return local_hits, web_trace
 
         web_trace["fallback_used"] = True
@@ -812,10 +859,7 @@ class SearchOrchestrator:
         rag_executed: bool,
         web_trace: dict[str, Any],
     ) -> dict[str, Any]:
-        trace = dict(rag_trace or {})
-        trace["query"] = {"text": query}
-        trace["analysis"] = query_analysis.to_dict()
-        trace["planner"] = {
+        planner_trace = {
             "plan_id": planner_output.plan_id,
             "need_web_search": planner_output.need_web_search,
             "source_route": planner_output.source_route,
@@ -827,18 +871,16 @@ class SearchOrchestrator:
             "query_expansion": planner_output.query_expansion,
             "retrieval_plan": planner_output.retrieval_plan,
         }
-        trace["rag"] = {
-            "executed": rag_executed,
-            "skip_reason": "",
-        }
-        trace["web"] = dict(web_trace)
-        trace["orchestrator"] = {
-            "active_architecture": "planner_orchestrator_rag_web",
-            "web_search_interface_ready": self.web_searcher is not None,
-            "web_routing_owner": "search_orchestrator",
-        }
-        trace["final_results"] = [self._hit_to_trace_row(item) for item in hits]
-        return trace
+        return build_orchestrator_trace(
+            query=query,
+            rag_trace=rag_trace,
+            analysis=query_analysis.to_dict(),
+            planner=planner_trace,
+            rag_executed=rag_executed,
+            web_trace=web_trace,
+            web_search_interface_ready=self.web_searcher is not None,
+            final_results=[self._hit_to_trace_row(item) for item in hits],
+        )
 
     def _apply_phase_a_serial_signals(
         self,
@@ -937,12 +979,4 @@ class SearchOrchestrator:
 
     @staticmethod
     def _merge_reasons(left: list[str], right: list[str]) -> list[str]:
-        merged = [str(item) for item in left if str(item).strip()]
-        seen = set(merged)
-        for item in right:
-            text = str(item).strip()
-            if not text or text in seen:
-                continue
-            merged.append(text)
-            seen.add(text)
-        return merged
+        return merge_reason_codes(left, right)
