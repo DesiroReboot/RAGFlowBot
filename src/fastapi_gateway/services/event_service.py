@@ -508,21 +508,11 @@ class FeishuEventService:
         query_preview = str(query or "").strip().replace("\n", " ")[:40]
         final_results = search_trace.get("final_results", []) if isinstance(search_trace, dict) else []
         result_count = len(final_results) if isinstance(final_results, list) else 0
-        domain_filter = planner.get("domain_filter", {}) if isinstance(planner, dict) else {}
-
         return {
             "query_hash": query_hash,
             "query_preview": query_preview,
-            "allow_rag": bool(planner.get("allow_rag", True)) if isinstance(planner, dict) else True,
-            "filter_reason": str(planner.get("filter_reason", "")).strip()
-            if isinstance(planner, dict)
-            else "",
-            "domain_decision": str(domain_filter.get("decision", "")).strip()
-            if isinstance(domain_filter, dict)
-            else "",
-            "domain_reason": str(domain_filter.get("reason", "")).strip()
-            if isinstance(domain_filter, dict)
-            else "",
+            "allow_rag": True,
+            "filter_reason": "",
             "rag_executed": bool(rag.get("executed", False)) if isinstance(rag, dict) else False,
             "rag_skip_reason": str(rag.get("skip_reason", "")).strip() if isinstance(rag, dict) else "",
             "result_count": result_count,

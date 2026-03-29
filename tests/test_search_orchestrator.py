@@ -29,7 +29,7 @@ class _StubRAGSearcher:
                 SearchResult(
                     file_uuid="f1",
                     source="kb-a.md",
-                    content="内容A",
+                    content="content a",
                     score=0.82,
                     chunk_id=1,
                     source_path="/kb/kb-a.md",
@@ -38,7 +38,7 @@ class _StubRAGSearcher:
                 SearchResult(
                     file_uuid="f2",
                     source="kb-b.md",
-                    content="内容B",
+                    content="content b",
                     score=0.64,
                     chunk_id=2,
                     source_path="/kb/kb-b.md",
@@ -194,10 +194,7 @@ def test_orchestrator_uses_planner_fields_and_skips_web_execution() -> None:
             need_web_search=True,
             source_route="hybrid",
             fusion_strategy="rag_fusion",
-            allow_rag=True,
-            filter_reason="score_above_threshold",
             domain_relevance_score=0.87,
-            domain_filter={"decision": "allow", "score": 0.87},
             reasons=["temporal_intent_detected"],
             retrieval_plan={"sources": [{"name": "kb_index", "enabled": True}]},
         )
@@ -210,56 +207,16 @@ def test_orchestrator_uses_planner_fields_and_skips_web_execution() -> None:
         config=None,
     )
 
-    result = orchestrator.search_with_trace("最近平台政策")
+    result = orchestrator.search_with_trace("latest policy")
 
     assert rag_searcher.called == 1
     assert web_searcher.called == 0
     assert len(result.hits) == 2
     assert result.trace_search["planner"]["source_route"] == "hybrid"
     assert result.trace_search["planner"]["fusion_strategy"] == "rag_fusion"
-    assert result.trace_search["planner"]["allow_rag"] is True
-    assert result.trace_search["planner"]["domain_filter"]["decision"] == "allow"
     assert result.trace_search["rag"]["executed"] is True
     assert result.trace_search["web"]["executed"] is False
     assert result.trace_search["web"]["skip_reason"] == "web_routing_unavailable"
-
-
-def test_orchestrator_skips_rag_when_blocked_by_domain_filter() -> None:
-    rag_searcher = _StubRAGSearcher()
-    planner = _StubPlanner(
-        output=PlannerOutput(
-            plan_id="plan-blocked",
-            need_web_search=False,
-            source_route="kb_only",
-            fusion_strategy="none",
-            allow_rag=False,
-            filter_reason="score_below_threshold",
-            domain_relevance_score=0.1,
-            domain_filter={"decision": "block", "score": 0.1, "negative_hits": ["nba"]},
-            reasons=["domain_filter:score_below_threshold"],
-            retrieval_plan={"sources": [{"name": "kb_index", "enabled": False}]},
-        )
-    )
-    orchestrator = SearchOrchestrator(
-        planner=planner,
-        rag_searcher=rag_searcher,
-        web_searcher=None,
-        config=None,
-    )
-
-    result = orchestrator.search_with_trace("今天NBA战况")
-
-    assert rag_searcher.called == 0
-    assert result.hits == []
-    assert result.citations == []
-    assert result.retrieval_confidence == 0.0
-    assert result.trace_search["planner"]["allow_rag"] is False
-    assert result.trace_search["planner"]["filter_reason"] == "score_below_threshold"
-    assert result.trace_search["planner"]["domain_filter"]["decision"] == "block"
-    assert result.trace_search["rag"]["executed"] is False
-    assert result.trace_search["rag"]["skip_reason"] == "score_below_threshold"
-    assert result.trace_search["web"]["requested"] is False
-    assert result.trace_search["web"]["skip_reason"] == "blocked_by_domain_filter"
 
 
 def test_orchestrator_executes_web_and_fuses_results() -> None:
@@ -270,10 +227,7 @@ def test_orchestrator_executes_web_and_fuses_results() -> None:
             need_web_search=True,
             source_route="hybrid",
             fusion_strategy="none",
-            allow_rag=True,
-            filter_reason="score_above_threshold",
             domain_relevance_score=0.8,
-            domain_filter={"decision": "allow", "score": 0.8},
             reasons=["temporal_intent_high"],
             retrieval_plan={"sources": [{"name": "kb_index", "enabled": True}]},
         )
@@ -319,10 +273,7 @@ def test_orchestrator_phase_a_triggers_web_when_rag_confidence_is_low() -> None:
             need_web_search=False,
             source_route="kb_only",
             fusion_strategy="none",
-            allow_rag=True,
-            filter_reason="score_above_threshold",
             domain_relevance_score=0.86,
-            domain_filter={"decision": "allow", "score": 0.86},
             reasons=["manual_planner_no_web"],
             retrieval_plan={"sources": [{"name": "kb_index", "enabled": True}]},
         )

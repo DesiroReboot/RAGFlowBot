@@ -73,18 +73,14 @@ class SearchOrchestrator:
         self.answer_top_k = max(1, int(answer_top_k))
 
     def search_with_trace(self, query: str) -> OrchestratorResult:
-        bootstrap_plan = self.planner.plan(
+        self.planner.plan(
             query,
             trace_context={"query_analysis": {"need_web_search": False, "reason_codes": ["bootstrap"]}},
         )
 
-        rag_executed = bool(bootstrap_plan.allow_rag)
-        rag_trace: dict[str, Any] = {}
-        if rag_executed:
-            rag_hits, rag_trace = self.rag_searcher.search_with_trace(query)
-            local_hits = [self._to_unified_hit(item) for item in rag_hits]
-        else:
-            local_hits = []
+        rag_hits, rag_trace = self.rag_searcher.search_with_trace(query)
+        local_hits = [self._to_unified_hit(item) for item in rag_hits]
+        rag_executed = True
 
         query_analysis = self._analyze_query(
             query=query,
@@ -96,13 +92,10 @@ class SearchOrchestrator:
             local_hits=local_hits,
         )
 
-        if rag_executed:
-            planner_output = self.planner.plan(
-                query,
-                trace_context={"query_analysis": query_analysis.to_dict()},
-            )
-        else:
-            planner_output = bootstrap_plan
+        planner_output = self.planner.plan(
+            query,
+            trace_context={"query_analysis": query_analysis.to_dict()},
+        )
 
         merged_hits, web_trace = self._apply_web_routing(
             query=query,
@@ -184,7 +177,7 @@ class SearchOrchestrator:
                 route_mode = "hybrid"
 
         web_trace: dict[str, Any] = {
-            "requested": bool(planner_output.allow_rag and need_web_search),
+            "requested": bool(need_web_search),
             "executed": False,
             "execution_skipped": False,
             "skip_reason": "",
@@ -206,12 +199,6 @@ class SearchOrchestrator:
             },
             "fallback_used": False,
         }
-
-        if not planner_output.allow_rag:
-            web_trace["requested"] = False
-            web_trace["execution_skipped"] = True
-            web_trace["skip_reason"] = "blocked_by_domain_filter"
-            return local_hits, web_trace
 
         if not self._web_routing_ready():
             web_trace["execution_skipped"] = True
@@ -834,10 +821,7 @@ class SearchOrchestrator:
             "source_route": planner_output.source_route,
             "route_mode": planner_output.route_mode,
             "fusion_strategy": planner_output.fusion_strategy,
-            "allow_rag": planner_output.allow_rag,
-            "filter_reason": planner_output.filter_reason,
             "domain_relevance_score": planner_output.domain_relevance_score,
-            "domain_filter": dict(planner_output.domain_filter),
             "confidence": planner_output.confidence,
             "reasons": planner_output.reasons,
             "query_expansion": planner_output.query_expansion,
@@ -845,7 +829,7 @@ class SearchOrchestrator:
         }
         trace["rag"] = {
             "executed": rag_executed,
-            "skip_reason": "" if rag_executed else planner_output.filter_reason,
+            "skip_reason": "",
         }
         trace["web"] = dict(web_trace)
         trace["orchestrator"] = {

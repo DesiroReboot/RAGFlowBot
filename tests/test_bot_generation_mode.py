@@ -15,14 +15,14 @@ def _build_agent(*, generation: GenerationConfig) -> ReActAgent:
 
 def _build_draft() -> AnswerDraft:
     return AnswerDraft(
-        query="如何优化选品策略？",
+        query="How should we optimize product selection?",
         theme="product_selection",
         steps=[
-            "先做市场需求验证，确认核心需求。",
-            "再评估竞争强度和利润空间。",
-            "最后小批量测试并复盘。",
+            "Validate market demand first.",
+            "Evaluate competition and margin.",
+            "Run a small pilot and review data.",
         ],
-        evidence=["市场需求需要先验证，再评估利润空间，最后进行小批量测试。"],
+        evidence=["Demand should be validated before scaling investment."],
         citations=[{"source": "trade-guide.md", "aliases": []}],
     )
 
@@ -59,7 +59,17 @@ def test_compose_answer_fallbacks_when_claim_support_low() -> None:
     draft = _build_draft()
     template_answer = agent._render_template_answer(draft)
     agent._hybrid_rewrite = (  # type: ignore[method-assign]
-        lambda **_: "问题：如何优化选品策略？\n建议执行步骤：\n1. 做品牌故事\n2. 做节日营销\n3. 做直播带货\n关键信息：\n- 全部使用外部经验\n参考来源：\n- trade-guide.md"
+        lambda **_: (
+            "Question: optimize product selection\n"
+            "Execution Steps:\n"
+            "1. Brand story\n"
+            "2. Festival marketing\n"
+            "3. Livestreaming\n"
+            "Key Info:\n"
+            "- all external experience\n"
+            "References:\n"
+            "- trade-guide.md"
+        )
     )
 
     answer, meta = agent._compose_answer(
@@ -84,14 +94,14 @@ def test_compose_answer_uses_hybrid_when_quality_checks_pass() -> None:
     draft = _build_draft()
     template_answer = agent._render_template_answer(draft)
     hybrid_answer = (
-        "问题：如何优化选品策略？\n"
-        "建议执行步骤：\n"
-        "1. 先做市场需求验证，确认核心需求。\n"
-        "2. 再评估竞争强度和利润空间。\n"
-        "3. 最后小批量测试并复盘。\n"
-        "关键信息：\n"
-        "- 市场需求需要先验证，再评估利润空间，最后进行小批量测试。\n"
-        "参考来源：\n"
+        "Question: optimize product selection\n"
+        "Execution Steps:\n"
+        "1. Validate market demand first.\n"
+        "2. Evaluate competition and margin.\n"
+        "3. Run a small pilot and review data.\n"
+        "Key Info:\n"
+        "- Demand should be validated before scaling investment.\n"
+        "References:\n"
         "- trade-guide.md\n"
     )
     agent._hybrid_rewrite = (  # type: ignore[method-assign]
@@ -109,20 +119,20 @@ def test_compose_answer_uses_hybrid_when_quality_checks_pass() -> None:
     assert meta["fallback_reason"] == ""
 
 
-def test_run_sync_returns_domain_out_of_scope_fallback_when_filter_blocks() -> None:
+def test_run_sync_returns_no_retrieval_fallback_when_search_empty() -> None:
     agent = ReActAgent.__new__(ReActAgent)
     agent.search_orchestrator = SimpleNamespace(
         search_with_trace=lambda query: SimpleNamespace(  # noqa: ARG005
             hits=[],
             citations=[],
             retrieval_confidence=0.0,
-            trace_search={"planner": {"allow_rag": False, "filter_reason": "score_below_threshold"}},
+            trace_search={"planner": {"filter_reason": "rag_all_queries"}},
         )
     )
     agent.manifest_store = SimpleNamespace(get_manifest=lambda: {"build_version": "rag-v2"})
 
-    response = agent.run_sync("今天NBA谁会赢", include_trace=True)
+    response = agent.run_sync("who wins nba today", include_trace=True)
 
-    assert "外贸/跨境电商" in response.answer
-    assert response.trace["strategy_execution"][0]["reason"] == "domain_out_of_scope"
-    assert response.trace["strategy_execution"][0]["filter_reason"] == "score_below_threshold"
+    assert response.answer
+    assert response.trace["strategy_execution"][0]["reason"] == "no_retrieval_results"
+    assert response.trace["strategy_execution"][0]["filter_reason"] == "rag_all_queries"

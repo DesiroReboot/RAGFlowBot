@@ -87,11 +87,7 @@ class ReActAgent:
             embedding_timeout=config.embedding.timeout,
             embedding_max_retries=config.embedding.max_retries,
         )
-        self.planner = RulePlanner(
-            domain_filter_enabled=config.search.domain_filter_enabled,
-            domain_filter_threshold=config.search.domain_filter_threshold,
-            domain_filter_fail_open=config.search.domain_filter_fail_open,
-        )
+        self.planner = RulePlanner()
         self.query_analyzer = QueryAnalyzer()
         self.web_search_client = WebSearchClient(
             provider=config.search.web_search_provider,
@@ -225,7 +221,7 @@ class ReActAgent:
 
         if not results:
             planner_trace = search_trace.get("planner", {}) if isinstance(search_trace, dict) else {}
-            allow_rag = bool(planner_trace.get("allow_rag", True))
+            allow_rag = True
             filter_reason = str(planner_trace.get("filter_reason", "")).strip()
 
             if not allow_rag:

@@ -5,13 +5,10 @@ from .orchestrator import OrchestratorResult, SearchOrchestrator, UnifiedSearchH
 from .web_result_evaluator import WebEvaluation, WebResultEvaluator
 from .web_router import WebRouteDecision, WebRouter
 from .web_search_client import WebSearchClient, WebSearchResult
-from .domain_filter import DomainFilter, DomainFilterResult
 
 __all__ = [
     "RAGSearcher",
     "SearchResult",
-    "DomainFilter",
-    "DomainFilterResult",
     "Planner",
     "RulePlanner",
     "PlannerOutput",

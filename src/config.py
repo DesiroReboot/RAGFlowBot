@@ -108,9 +108,6 @@ class SearchConfig:
     vec_top_k: int = 20
     fusion_rrf_k: int = 60
     context_top_k: int = 6
-    domain_filter_enabled: bool = True
-    domain_filter_threshold: float = 0.45
-    domain_filter_fail_open: bool = True
     web_search_enabled: bool = False
     web_search_provider: str = "mock"
     web_search_timeout: int = 8
@@ -267,26 +264,6 @@ class Config:
             vec_top_k=int(_env("ECBOT_VEC_TOP_K", search_data.get("vec_top_k", 20))),
             fusion_rrf_k=int(_env("ECBOT_FUSION_RRF_K", search_data.get("fusion_rrf_k", 60))),
             context_top_k=int(_env("ECBOT_CONTEXT_TOP_K", search_data.get("context_top_k", 6))),
-            domain_filter_enabled=_as_bool(
-                _env(
-                    "ECBOT_DOMAIN_FILTER_ENABLED",
-                    search_data.get("domain_filter_enabled", True),
-                ),
-                True,
-            ),
-            domain_filter_threshold=float(
-                _env(
-                    "ECBOT_DOMAIN_FILTER_THRESHOLD",
-                    search_data.get("domain_filter_threshold", 0.45),
-                )
-            ),
-            domain_filter_fail_open=_as_bool(
-                _env(
-                    "ECBOT_DOMAIN_FILTER_FAIL_OPEN",
-                    search_data.get("domain_filter_fail_open", True),
-                ),
-                True,
-            ),
             web_search_enabled=_as_bool(
                 _env("ECBOT_WEB_SEARCH_ENABLED", search_data.get("web_search_enabled", False)),
                 False,
