@@ -1,8 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import re
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from src.config import Config
@@ -42,9 +43,14 @@ class AgentResponse:
 class AnswerDraft:
     query: str
     theme: str
-    steps: list[str]
-    evidence: list[str]
-    citations: list[dict[str, Any]]
+    answer_mode: str = "fact_qa"
+    steps: list[str] = field(default_factory=list)
+    key_points: list[str] = field(default_factory=list)
+    point_source_tags: list[str] = field(default_factory=list)
+    source_rows: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+    citations: list[dict[str, Any]] = field(default_factory=list)
+    fact_units: list[dict[str, Any]] = field(default_factory=list)
 
 
 SearchHit = SearchResult | UnifiedSearchHit
@@ -101,6 +107,10 @@ class ReActAgent:
             embedding_batch_size=config.embedding.batch_size,
             embedding_timeout=config.embedding.timeout,
             embedding_max_retries=config.embedding.max_retries,
+            source_quota_mode=config.search.source_quota_mode,
+            max_chunks_per_source=config.search.max_chunks_per_source,
+            qa_anchor_enabled=config.search.qa_anchor_enabled,
+            semantic_guard_enabled=config.search.semantic_guard_enabled,
         )
         self.planner = RulePlanner()
         self.query_analyzer = QueryAnalyzer()
@@ -775,13 +785,37 @@ class ReActAgent:
         query_terms = self._query_terms(query)
         theme = self._detect_theme(query, selected)
         evidence = self._extract_evidence(query=query, selected=selected, limit=6)
-        steps = self._build_thematic_steps(theme=theme, query_terms=query_terms)
+        answer_mode = self._route_answer_mode(query=query, selected=selected)
+        steps = self._build_thematic_steps(theme=theme, query_terms=query_terms) if answer_mode != "fact_qa" else []
+        source_rows, source_tags = self._build_source_rows(selected=selected, citations=citations)
+        if not source_rows:
+            source_rows = ["[S1] 无可用来源 | 片段缺失 | reference"]
+            source_tags = ["S1"]
+
+        fact_units = self._extract_fact_units(selected=selected, query=query)
+        filtered_facts = self._filter_facts_by_qa_mapping(facts=fact_units, query=query)
+        source_tag_map = self._source_tag_map_from_rows(source_rows)
+
+        key_points = self._build_key_points(query=query, evidence=evidence, selected=selected, limit=4)
+        point_source_tags = [source_tags[idx % len(source_tags)] for idx, _ in enumerate(key_points)] if key_points else []
+        if filtered_facts and answer_mode == "fact_qa":
+            key_points = [str(fact.get("statement", "")).strip() for fact in filtered_facts[:4] if str(fact.get("statement", "")).strip()]
+            point_source_tags = [
+                source_tag_map.get(str(fact.get("source", "")).strip(), source_tags[0])
+                for fact in filtered_facts[: len(key_points)]
+            ]
+
         return AnswerDraft(
             query=query,
             theme=theme,
+            answer_mode=answer_mode,
             steps=steps,
+            key_points=key_points,
+            point_source_tags=point_source_tags,
+            source_rows=source_rows,
             evidence=evidence,
             citations=citations,
+            fact_units=filtered_facts,
         )
 
     def _compose_answer(
@@ -802,6 +836,8 @@ class ReActAgent:
             "quality_score": 1.0,
             "claim_support_rate": 1.0,
             "citation_coverage": 1.0,
+            "point_source_binding_rate": 1.0,
+            "answer_mode": draft.answer_mode,
         }
         if requested_mode == "template":
             return template_answer, generation_meta
@@ -821,10 +857,12 @@ class ReActAgent:
         quality_score, quality_issues = self._evaluate_answer_quality(rewritten, draft)
         claim_support_rate = self._estimate_claim_support(rewritten, draft.evidence)
         citation_coverage = self._estimate_citation_coverage(rewritten, draft.citations)
+        point_source_binding_rate = self._point_source_binding_rate(rewritten)
 
         generation_meta["quality_score"] = round(quality_score, 4)
         generation_meta["claim_support_rate"] = round(claim_support_rate, 4)
         generation_meta["citation_coverage"] = round(citation_coverage, 4)
+        generation_meta["point_source_binding_rate"] = round(point_source_binding_rate, 4)
         if quality_issues:
             generation_meta["quality_issues"] = quality_issues
 
@@ -837,6 +875,11 @@ class ReActAgent:
         if citation_coverage < float(self.config.generation.min_citation_coverage):
             generation_meta["fallback_reason"] = GenerationFallbackReason.CITATION_COVERAGE_BELOW_THRESHOLD.value
             return template_answer, generation_meta
+        if bool(getattr(self.config.generation, "force_point_source_format", True)) and not self._paragraph_output_enabled():
+            min_binding = float(getattr(self.config.generation, "min_point_source_binding_rate", 1.0))
+            if point_source_binding_rate < min_binding:
+                generation_meta["fallback_reason"] = "point_source_binding_below_threshold"
+                return template_answer, generation_meta
 
         generation_meta["final_mode"] = "hybrid"
         return rewritten, generation_meta
@@ -875,33 +918,49 @@ class ReActAgent:
             for citation in draft.citations
             if str(citation.get("source", "")).strip()
         ]
+        paragraph_output = self._paragraph_output_enabled()
         rewritten = self.generation_client.rewrite(
             query=draft.query,
             template_answer=template_answer,
+            answer_mode=draft.answer_mode,
+            key_points=draft.key_points,
             steps=draft.steps,
             evidence=draft.evidence,
             citation_sources=citation_sources,
+            paragraph_output=paragraph_output,
         )
         return rewritten.strip()
 
     def _evaluate_answer_quality(self, answer: str, draft: AnswerDraft) -> tuple[float, list[str]]:
         score = 1.0
         issues: list[str] = []
-        required_sections = ["问题：", "建议执行步骤：", "参考来源："]
-        if draft.evidence:
-            required_sections.append("关键信息：")
+        paragraph_output = self._paragraph_output_enabled()
+        required_sections = ["来源："]
+        if not paragraph_output:
+            required_sections = ["要点：", "来源："]
+            if draft.answer_mode in {"procedure", "mixed"} and draft.steps:
+                required_sections.append("执行建议：")
         missing_sections = [section for section in required_sections if section not in answer]
         if missing_sections:
             score -= 0.45
             issues.append(f"missing_sections:{','.join(missing_sections)}")
 
-        step_count = len(re.findall(r"(?m)^\d+\.\s+", answer))
-        if step_count < min(3, len(draft.steps)):
-            score -= 0.2
-            issues.append("insufficient_step_count")
+        if not paragraph_output and draft.answer_mode in {"procedure", "mixed"} and draft.steps:
+            step_count = len(re.findall(r"(?m)^\\d+\\.\\s+", answer))
+            if step_count < min(2, len(draft.steps)):
+                score -= 0.08
+                issues.append("insufficient_step_count")
 
-        if len(answer.strip()) < 80:
+        binding_rate = self._point_source_binding_rate(answer)
+        if not paragraph_output and binding_rate < 1.0:
+            score -= 0.25
+            issues.append(f"point_source_binding_rate:{round(binding_rate, 4)}")
+        if paragraph_output and not re.search(r"\[S\d+\]", answer):
             score -= 0.2
+            issues.append("missing_inline_source_tag")
+
+        if len(answer.strip()) < 60:
+            score -= 0.15
             issues.append("answer_too_short")
 
         readability = self._readability_ratio(answer)
@@ -917,6 +976,10 @@ class ReActAgent:
                 issues.append("high_repetition")
 
         return max(0.0, min(1.0, score)), issues
+
+    def _paragraph_output_enabled(self) -> bool:
+        search_cfg = getattr(self.config, "search", None)
+        return bool(getattr(search_cfg, "paragraph_output_enabled", True))
 
     def _estimate_claim_support(self, answer: str, evidence: list[str]) -> float:
         if not evidence:
@@ -953,23 +1016,25 @@ class ReActAgent:
     def _readability_ratio(self, text: str) -> float:
         if not text.strip():
             return 0.0
-        readable = re.findall(r"[A-Za-z0-9\u4e00-\u9fff，。！？；：、（）()《》“”‘’\- .:\n]", text)
+        readable = re.findall(r"[A-Za-z0-9\u4e00-\u9fff，。！？；：、（）\\[\\]\\- .:\n]", text)
         return len(readable) / max(len(text), 1)
 
     def _split_claims(self, answer: str) -> list[str]:
-        lines = []
+        lines: list[str] = []
         in_reference = False
         for raw in answer.splitlines():
             line = raw.strip()
             if not line:
                 continue
-            if line.startswith("参考来源："):
+            if line.startswith("来源："):
                 in_reference = True
                 continue
             if in_reference:
                 continue
-            if line.endswith("：") and line in {"问题：", "建议执行步骤：", "关键信息："}:
+            if line in {"要点：", "执行建议："}:
                 continue
+            if line.startswith("-") and re.search(r"\[S\d+\]", line):
+                line = re.sub(r"^[-*]\s*\[S\d+\]\s*", "", line).strip()
             lines.append(line)
 
         claims: list[str] = []
@@ -980,6 +1045,33 @@ class ReActAgent:
                 if len(normalized) >= 8:
                     claims.append(normalized)
         return claims
+
+    def _point_source_binding_rate(self, answer: str) -> float:
+        if self._paragraph_output_enabled():
+            claims = [line for line in self._split_claims(answer) if line.strip()]
+            if not claims:
+                return 0.0
+            bound = sum(1 for claim in claims if re.search(r"\[S\d+\]", claim))
+            return bound / max(len(claims), 1)
+
+        point_lines: list[str] = []
+        in_points = False
+        for raw in answer.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if line == "要点：":
+                in_points = True
+                continue
+            if line in {"来源：", "执行建议："}:
+                in_points = False
+                continue
+            if in_points and line.startswith("-"):
+                point_lines.append(line)
+        if not point_lines:
+            return 0.0
+        bound = sum(1 for line in point_lines if re.search(r"\[S\d+\]", line))
+        return bound / max(len(point_lines), 1)
 
     def _text_tokens(self, text: str) -> set[str]:
         lowered = text.lower()
@@ -993,22 +1085,28 @@ class ReActAgent:
         return len(left & right) / len(left)
 
     def _render_template_answer(self, draft: AnswerDraft) -> str:
-        lines = [f"问题：{draft.query}", "建议执行步骤："]
-        for idx, step in enumerate(draft.steps, start=1):
-            lines.append(f"{idx}. {step}")
+        if self._paragraph_output_enabled():
+            return self._compose_paragraph_answer(facts=draft.fact_units, draft=draft)
 
-        if draft.evidence:
-            lines.append("关键信息：")
-            for sentence in draft.evidence[:3]:
-                lines.append(f"- {sentence}")
+        lines = ["要点："]
+        points = draft.key_points or draft.evidence[:3]
+        if not points:
+            lines.append("- [S1] 信息不足：当前检索证据不足以形成可验证要点。")
+        else:
+            tags = draft.point_source_tags or ["S1"]
+            for idx, point in enumerate(points):
+                tag = tags[idx % len(tags)]
+                lines.append(f"- [{tag}] {point}")
 
-        lines.append("参考来源：")
-        for citation in draft.citations:
-            aliases = [str(alias) for alias in citation.get("aliases", []) if str(alias).strip()]
-            if aliases:
-                lines.append(f"- {citation['source']} (备选版本: {'; '.join(aliases)})")
-            else:
-                lines.append(f"- {citation['source']}")
+        lines.append("来源：")
+        for row in draft.source_rows:
+            lines.append(f"- {row}")
+
+        if draft.answer_mode in {"procedure", "mixed"} and draft.steps:
+            lines.append("执行建议：")
+            for idx, step in enumerate(draft.steps[:4], start=1):
+                lines.append(f"{idx}. {step}")
+
         return "\n".join(lines)
 
     def _build_human_answer(self, *, query: str, selected: list[Any]) -> str:
@@ -1016,17 +1114,336 @@ class ReActAgent:
         draft = self._build_answer_draft(query=query, selected=selected, citations=citations)
         return self._render_template_answer(draft)
 
+    def _route_answer_mode(self, *, query: str, selected: list[Any]) -> str:
+        query_lower = str(query or "").lower()
+        default_mode = str(getattr(self.config.generation, "default_answer_mode", "fact_qa")).strip().lower()
+        if default_mode not in {"fact_qa", "procedure", "mixed"}:
+            default_mode = "fact_qa"
+
+        fact_markers = (
+            "是什么",
+            "定义",
+            "组成",
+            "区别",
+            "含义",
+            "包括",
+            "why",
+            "what is",
+            "difference",
+            "define",
+        )
+        procedure_markers = (
+            "怎么",
+            "如何",
+            "步骤",
+            "流程",
+            "执行",
+            "落地",
+            "how to",
+            "step",
+            "process",
+        )
+        has_fact = any(marker in query_lower for marker in fact_markers)
+        has_procedure = any(marker in query_lower for marker in procedure_markers)
+
+        kind_counts = {"qa_fact": 0, "procedure": 0, "reference": 0}
+        for item in selected:
+            kind = str(getattr(item, "chunk_kind", "") or "").strip().lower()
+            if kind in kind_counts:
+                kind_counts[kind] += 1
+
+        if has_fact and not has_procedure:
+            return "fact_qa"
+        if has_procedure and not has_fact:
+            return "procedure"
+        if has_fact and has_procedure:
+            return "mixed"
+        if kind_counts["qa_fact"] > kind_counts["procedure"]:
+            return "fact_qa"
+        if kind_counts["procedure"] > kind_counts["qa_fact"]:
+            return "procedure"
+        if kind_counts["qa_fact"] and kind_counts["procedure"]:
+            return "mixed"
+        return default_mode
+
+    def _build_key_points(self, *, query: str, evidence: list[str], selected: list[Any], limit: int) -> list[str]:
+        points: list[str] = []
+        seen: set[str] = set()
+        for sentence in evidence:
+            text = str(sentence).strip()
+            if not text:
+                continue
+            if self._is_index_like_line(text):
+                continue
+            normalized = re.sub(r"\s+", " ", text)
+            dedupe_key = normalized.lower()
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            points.append(normalized)
+            if len(points) >= limit:
+                return points
+
+        for item in selected:
+            content = str(getattr(item, "content", "")).strip()
+            if not content:
+                continue
+            for sentence in self._split_sentences(content):
+                normalized = re.sub(r"\s+", " ", str(sentence).strip())
+                if not normalized or self._is_index_like_line(normalized):
+                    continue
+                dedupe_key = normalized.lower()
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                points.append(normalized)
+                if len(points) >= limit:
+                    return points
+        return points
+
+    def _build_source_rows(
+        self,
+        *,
+        selected: list[Any],
+        citations: list[dict[str, Any]],
+    ) -> tuple[list[str], list[str]]:
+        source_meta: dict[str, dict[str, str]] = {}
+        for item in selected:
+            source = str(getattr(item, "source", "")).strip()
+            if not source:
+                continue
+            section = str(getattr(item, "section_path", "") or getattr(item, "section_title", "")).strip()
+            chunk_kind = str(getattr(item, "chunk_kind", "procedure")).strip() or "procedure"
+            if not section:
+                section = self._infer_section_locator(item)
+            existing = source_meta.get(source)
+            if existing:
+                existing_section = str(existing.get("section", "")).strip()
+                existing_is_fallback = (
+                    existing_section == "片段定位缺失"
+                    or existing_section.startswith("chunk#")
+                )
+                if existing_is_fallback and section != "片段定位缺失":
+                    existing["section"] = section
+                continue
+            source_meta[source] = {
+                "section": section or "片段定位缺失",
+                "kind": chunk_kind,
+            }
+
+        rows: list[str] = []
+        tags: list[str] = []
+        ordered_sources: list[str] = []
+        for citation in citations:
+            source = str(citation.get("source", "")).strip()
+            if not source or source in ordered_sources:
+                continue
+            ordered_sources.append(source)
+        for source in source_meta:
+            if source not in ordered_sources:
+                ordered_sources.append(source)
+
+        for idx, source in enumerate(ordered_sources, start=1):
+            tag = f"S{idx}"
+            meta = source_meta.get(source, {"section": "片段定位缺失", "kind": "reference"})
+            rows.append(f"[{tag}] {source} | {meta['section']} | {meta['kind']}")
+            tags.append(tag)
+        return rows, tags
+
+    def _source_tag_map_from_rows(self, source_rows: list[str]) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        for row in source_rows:
+            match = re.match(r"^\[(S\d+)\]\s+(.+?)\s+\|", str(row).strip())
+            if not match:
+                continue
+            tag, source = match.groups()
+            mapping[source.strip()] = tag.strip()
+        return mapping
+
+    def _extract_fact_units(self, *, selected: list[Any], query: str) -> list[dict[str, Any]]:
+        query_terms = self._query_terms(query)
+        relation_markers = ("=", "+", "组成", "构成", "包括", "由", "等于", "包含", "含")
+        incoterms = ("fob", "cfr", "cif", "exw")
+        component_markers = (
+            "国内运费",
+            "报关费",
+            "装船费",
+            "港口杂费",
+            "国际海运费",
+            "海运保险费",
+            "inland freight",
+            "customs fee",
+            "sea freight",
+            "insurance",
+        )
+
+        facts: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for rank, item in enumerate(selected, start=1):
+            source = str(getattr(item, "source", "")).strip()
+            content = str(getattr(item, "content", "")).strip()
+            if not source or not content:
+                continue
+            for sentence in self._split_sentences(content):
+                text = str(sentence).strip()
+                if not text:
+                    continue
+                lowered = text.lower()
+                if not any(term in lowered for term in incoterms):
+                    continue
+
+                has_relation = any(marker in text or marker in lowered for marker in relation_markers)
+                if not has_relation:
+                    continue
+
+                subject = next((term.upper() for term in incoterms if term in lowered), "")
+                relation = "equation" if ("=" in text or "等于" in text or "公式" in text) else "composition"
+                objects = [marker for marker in component_markers if marker in lowered or marker in text]
+                overlap = sum(1 for token in query_terms if token and token in lowered)
+                confidence = min(1.0, 0.35 + 0.18 * overlap + 0.08 * len(objects) - 0.03 * (rank - 1))
+                dedupe_key = f"{source.lower()}::{re.sub(r'\\s+', ' ', text.lower())}"
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                facts.append(
+                    {
+                        "source": source,
+                        "subject": subject,
+                        "relation": relation,
+                        "objects": objects,
+                        "statement": text,
+                        "confidence": round(max(0.0, confidence), 4),
+                    }
+                )
+
+        facts.sort(
+            key=lambda row: (
+                float(row.get("confidence", 0.0)),
+                1 if str(row.get("relation", "")) == "equation" else 0,
+                len(row.get("objects", [])) if isinstance(row.get("objects"), list) else 0,
+            ),
+            reverse=True,
+        )
+        return facts[:12]
+
+    def _filter_facts_by_qa_mapping(self, *, facts: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+        if not facts:
+            return []
+
+        query_lower = str(query or "").lower()
+        relation_query = any(marker in query_lower for marker in ("组成", "构成", "公式", "计算", "等于", "包含"))
+        target_subjects = {marker.upper() for marker in ("fob", "cfr", "cif", "exw") if marker in query_lower}
+
+        primary: list[dict[str, Any]] = []
+        support: list[dict[str, Any]] = []
+        for fact in facts:
+            statement = str(fact.get("statement", "")).lower()
+            subject = str(fact.get("subject", "")).upper()
+            relation = str(fact.get("relation", ""))
+
+            direct_subject_hit = bool(target_subjects) and (subject in target_subjects or any(token.lower() in statement for token in target_subjects))
+            relation_ok = relation in {"equation", "composition"}
+            if direct_subject_hit and relation_ok:
+                primary.append(fact)
+                continue
+
+            if relation_query and relation_ok and any(marker in statement for marker in ("fob", "cfr", "cif", "exw")):
+                support.append(fact)
+
+        if primary:
+            return primary[:4] + support[:1]
+        if relation_query and support:
+            return support[:4]
+        return facts[:4]
+
+    def _compose_paragraph_answer(self, *, facts: list[dict[str, Any]], draft: AnswerDraft) -> str:
+        source_tag_map = self._source_tag_map_from_rows(draft.source_rows)
+        facts_for_answer = facts or [
+            {"statement": point, "source": ""}
+            for point in (draft.key_points or draft.evidence[:3])
+            if str(point).strip()
+        ]
+        if not facts_for_answer:
+            facts_for_answer = [{"statement": "当前检索证据不足，无法给出可验证的关系结论。", "source": ""}]
+
+        tagged_statements: list[str] = []
+        seen: set[str] = set()
+        for fact in facts_for_answer[:5]:
+            statement = re.sub(r"\s+", " ", str(fact.get("statement", "")).strip())
+            if not statement:
+                continue
+            source = str(fact.get("source", "")).strip()
+            tag = source_tag_map.get(source, "S1")
+            normalized = f"{statement}[{tag}]"
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            tagged_statements.append(normalized)
+
+        if not tagged_statements:
+            tagged_statements = ["当前检索证据不足，无法给出可验证的关系结论。[S1]"]
+
+        lead = f"围绕“{draft.query}”，当前证据显示：{tagged_statements[0]}。"
+        detail = ""
+        if len(tagged_statements) > 1:
+            detail = "进一步可确认的是：" + "；".join(tagged_statements[1:]) + "。"
+
+        lines = [lead]
+        if detail:
+            lines.append(detail)
+        if draft.answer_mode in {"procedure", "mixed"} and draft.steps:
+            steps_text = "；".join(step.strip() for step in draft.steps[:3] if step.strip())
+            if steps_text:
+                lines.append(f"可执行顺序建议：{steps_text}。")
+        lines.append("来源：")
+        for row in draft.source_rows:
+            lines.append(f"- {row}")
+        return "\n\n".join(lines[:2]) + ("\n\n" + "\n".join(lines[2:]) if len(lines) > 2 else "")
+
+    @staticmethod
+    def _infer_section_locator(item: Any) -> str:
+        chunk_id = getattr(item, "chunk_id", None)
+        try:
+            chunk_num = int(chunk_id)
+        except Exception:
+            chunk_num = -1
+        if chunk_num >= 0:
+            return f"chunk#{chunk_num}"
+
+        source_path = str(getattr(item, "source_path", "")).strip()
+        if source_path:
+            if source_path.startswith(("http://", "https://")):
+                return source_path
+            try:
+                return Path(source_path).name or source_path
+            except Exception:
+                return source_path
+        return "片段定位缺失"
+
+    def _is_index_like_line(self, text: str) -> bool:
+        line = str(text or "").strip()
+        if not line:
+            return True
+        if re.fullmatch(r"\d+(?:\.\d+){1,6}\s*[\u4e00-\u9fffA-Za-z0-9_()（）-]{0,50}", line):
+            return True
+        if re.search(r"[.·。]{3,}\s*\d{1,4}$", line):
+            return True
+        if len(line) <= 18 and re.fullmatch(r"[\d.\-_/()（）\sA-Za-z\u4e00-\u9fff]+", line):
+            if len(re.findall(r"[\u4e00-\u9fffA-Za-z]", line)) <= 6:
+                return True
+        return False
+
     def _detect_theme(self, query: str, selected: list[Any]) -> str:
-        query_text = query.lower()
+        query_text = str(query or "").lower()
         source_text = " ".join(str(getattr(item, "source", "")) for item in selected).lower()
         theme_keywords = {
             "product_selection": ["选品", "类目", "需求", "利润", "竞争"],
-            "listing": ["listing", "标题", "主图", "关键词", "上架", "五点"],
+            "listing": ["listing", "标题", "主图", "关键词", "五点"],
             "advertising": ["acos", "广告", "ppc", "出价", "投放"],
-            "logistics": ["物流", "发货", "fba", "货运", "报关", "装船"],
-            "customer_service": ["客服", "消息", "差评", "售后", "回复"],
+            "logistics": ["物流", "发货", "fba", "货运", "报关"],
+            "customer_service": ["客服", "消息", "差评", "售后"],
             "inventory": ["库存", "断货", "补货", "周转", "安全库存"],
-            "promotion": ["促销", "折扣", "活动", "秒杀", "优惠"],
+            "promotion": ["促销", "折扣", "活动", "秒杀"],
             "conversion": ["转化", "点击", "加购", "成交", "评价"],
             "account_security": ["关联", "封号", "账号", "安全", "风控"],
         }
@@ -1042,67 +1459,32 @@ class ReActAgent:
         return best_theme
 
     def _build_thematic_steps(self, *, theme: str, query_terms: list[str]) -> list[str]:
-        focus = "、".join(query_terms[:3]) if query_terms else "当前问题"
+        focus = ", ".join(query_terms[:3]) if query_terms else "当前问题"
         mapping = {
             "product_selection": [
-                "先做市场需求验证，确认目标人群、使用场景和销量趋势。",
-                "再评估竞争强度，重点看卖家数量、评价密度和价格带。",
-                "核算利润空间，至少覆盖采购、物流、平台费用和广告成本。",
-                "检查供应链与合规风险，避免侵权、禁运和交期不稳定。",
-                "用小批量测试验证结果，再按数据迭代选品策略。",
+                "先确认目标人群、需求强度和可验证销量信号。",
+                "再对比竞品密度、价格带和利润空间。",
+                "最后用小批量测试复核需求与转化。",
             ],
             "listing": [
-                "先确定核心关键词与主卖点，明确标题和主图表达重点。",
-                "优化标题、五点和详情页，确保信息一致且可搜索。",
-                "补齐转化要素，如价格策略、评价素材和信任信息。",
-                "上线后跟踪曝光、点击和转化，定位弱项逐项优化。",
+                "先明确核心关键词与主卖点，统一标题和主图表达。",
+                "补齐详情页关键信息，减少用户决策阻力。",
+                "跟踪点击率与转化率，按数据迭代页面内容。",
             ],
             "advertising": [
-                "先拆分投放目标与预算，区分引流词和转化词。",
-                "按词分组设置出价与匹配方式，避免高耗低转化。",
-                "持续清理无效词，保留高相关高转化词。",
-                "结合 ACOS 与利润线做调价，维持可持续投放。",
+                "拆分流量词和转化词，分别设置预算与出价。",
+                "持续清理低效词，保留高相关高转化词。",
+                "结合 ACOS 与毛利线动态调价。",
             ],
             "logistics": [
-                "先确认发货模式与时效要求，匹配对应物流方案。",
-                "核对包装、标签与报关资料，降低异常和退件风险。",
-                "按体积重与实重核算运费，控制单位物流成本。",
-                "建立节点追踪和异常预案，保证交付稳定。",
-            ],
-            "customer_service": [
-                "先设定回复时效标准，保证关键消息及时处理。",
-                "按问题类型准备标准话术，提高首轮解决率。",
-                "针对差评先定位根因，再给出可执行补救方案。",
-                "沉淀高频问题与处理结果，持续优化客服 SOP。",
-            ],
-            "inventory": [
-                "先建立安全库存阈值，明确补货触发条件。",
-                "按销量趋势和补货周期预测需求，减少断货风险。",
-                "将库存分层管理，优先保障核心 SKU。",
-                "每周复盘周转与缺货率，动态调整补货计划。",
-            ],
-            "promotion": [
-                "先明确活动目标与人群，再选择合适促销机制。",
-                "控制折扣力度与毛利底线，避免只增量不增利。",
-                "将活动与广告节奏联动，提升流量承接效率。",
-                "活动后复盘转化和利润，保留有效方案。",
-            ],
-            "conversion": [
-                "先定位转化漏斗卡点，区分流量问题与页面问题。",
-                "优化主图、卖点和价格策略，提升点击后成交率。",
-                "补齐评价与问答等信任要素，降低决策阻力。",
-                "按周跟踪转化率和客单价，持续做 A/B 优化。",
-            ],
-            "account_security": [
-                "先梳理账号环境与操作规范，避免高风险行为。",
-                "隔离设备、网络与权限，降低关联概率。",
-                "建立异常监控与告警，及时处理风控信号。",
-                "保留合规证据链，便于申诉与风险复盘。",
+                "先确认发货模式、时效和成本边界。",
+                "核对报关资料与标签包装完整性。",
+                "建立异常预案并跟踪关键物流节点。",
             ],
             "general": [
-                f"先明确“{focus}”的目标、约束和成功标准。",
-                "优先使用可核验的数据或规则做判断，避免仅凭单一片段决策。",
-                "把关键结论拆成步骤执行，并在执行后复盘结果再迭代。",
+                f"先明确“{focus}”的目标、约束和验收标准。",
+                "优先基于可验证证据做判断，避免经验性跳结论。",
+                "执行后复盘结果并更新下一轮动作。",
             ],
         }
         return mapping.get(theme, mapping["general"])
@@ -1110,7 +1492,7 @@ class ReActAgent:
     def _extract_evidence(self, *, query: str, selected: list[Any], limit: int) -> list[str]:
         query_terms = self._query_terms(query)
         query_has_cjk = bool(re.search(r"[\u4e00-\u9fff]", query))
-        action_markers = ("需要", "建议", "应", "可", "先", "再", "避免", "评估", "分析", "优化")
+        action_markers = ("建议", "需要", "必须", "应当", "步骤", "流程", "should", "must")
         scored: list[tuple[float, str]] = []
         seen_sentences: set[str] = set()
 
@@ -1119,25 +1501,27 @@ class ReActAgent:
             if not content:
                 continue
             for sentence in self._split_sentences(content):
-                if query_has_cjk and not re.search(r"[\u4e00-\u9fff]{2,}", sentence):
+                normalized = str(sentence).strip()
+                if not normalized or self._is_index_like_line(normalized):
                     continue
-                key = sentence.lower()
+                if query_has_cjk and not re.search(r"[\u4e00-\u9fff]{2,}", normalized):
+                    continue
+                key = normalized.lower()
                 if key in seen_sentences:
                     continue
                 seen_sentences.add(key)
-                hit_count = sum(1 for term in query_terms if term and term in sentence.lower())
-                marker_bonus = 1 if any(marker in sentence for marker in action_markers) else 0
+                hit_count = sum(1 for term in query_terms if term and term in key)
+                marker_bonus = 1 if any(marker in normalized.lower() for marker in action_markers) else 0
                 source_bonus = max(0.0, 0.5 - 0.1 * (rank - 1))
-                length_penalty = 0.2 if len(sentence) > 90 else 0.0
+                length_penalty = 0.2 if len(normalized) > 100 else 0.0
                 score = hit_count + marker_bonus + source_bonus - length_penalty
-                scored.append((score, sentence))
+                scored.append((score, normalized))
 
         scored.sort(key=lambda row: row[0], reverse=True)
-        evidence = [sentence for _, sentence in scored[:limit]]
-        return evidence
+        return [sentence for _, sentence in scored[:limit]]
 
     def _split_sentences(self, text: str) -> list[str]:
-        raw_parts = re.split(r"[。！？\n]+", text.replace("\r", "\n"))
+        raw_parts = re.split(r"[。！？；\n]+", text.replace("\r", "\n"))
         sentences: list[str] = []
         for part in raw_parts:
             line = part.strip()
@@ -1174,12 +1558,21 @@ class ReActAgent:
         noise_markers = ("flatedecode", "xref", "obj", "endobj", "stream", "/filter", "/length")
         if any(marker in lowered for marker in noise_markers):
             return False
-        readable = re.findall(r"[A-Za-z0-9\u4e00-\u9fff，。！？；：、（）()《》“”‘’\- ]", cleaned)
-        ratio = len(readable) / max(len(cleaned), 1)
-        if ratio < 0.75:
-            return False
-        has_cjk_word = bool(re.search(r"[\u4e00-\u9fff]{2,}", cleaned))
-        if has_cjk_word:
+        # Accept normal Chinese lines first; this avoids regex-escape edge cases
+        # from mixed CJK/punctuation content extracted from PDFs.
+        if re.search(r"[\u4e00-\u9fff]{2,}", cleaned):
             return True
+
+        readable = re.findall(r"[A-Za-z0-9\s,.;:!?()\[\]{}\-_/%+]", cleaned)
+        ratio = len(readable) / max(len(cleaned), 1)
+        if ratio < 0.7:
+            return False
         english_words = re.findall(r"[A-Za-z]{2,}", cleaned)
         return len(english_words) >= 3
+
+
+
+
+
+
+

@@ -49,6 +49,8 @@ pytest_tmp*/
 pytest_temp*/
 tmp_pytest*/
 tmp_test*/
+tmp_*/
+kbbug_*/
 gw_manual_tmp/
 tmp/
 temp/
@@ -56,3 +58,4 @@ temp/
 *.temp
 
 Doc/
+CLAUDE.md

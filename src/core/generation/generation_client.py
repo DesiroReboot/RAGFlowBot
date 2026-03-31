@@ -30,30 +30,45 @@ class GenerationClient:
         *,
         query: str,
         template_answer: str,
+        answer_mode: str = "fact_qa",
+        key_points: list[str] | None = None,
         steps: list[str],
         evidence: list[str],
         citation_sources: list[str],
+        paragraph_output: bool = True,
     ) -> str:
         if not self.available:
             raise RuntimeError("generation client unavailable")
 
+        format_instruction = (
+            "输出结构：先给自然段回答，再给“来源：”区块。不要输出“要点：/执行建议：”标题。"
+            if paragraph_output
+            else "输出结构：保留“要点：”“来源：”，若有步骤再给“执行建议：”。"
+        )
         system_prompt = (
-            "你是企业知识库问答的中文编辑器。"
-            "你只能重写表达，不能新增事实、不能新增来源、不能删掉关键步骤。"
-            "输出必须保持以下段落标题：问题：、建议执行步骤：、关键信息：、参考来源：。"
-            "步骤必须使用 1. 2. 3. 的编号格式。"
-            "若证据不足，只能更谨慎表达，不得编造。"
+            "你是企业知识库问答的中文改写编辑器。"
+            "你只能重写表达，不能新增事实、不能新增来源、不能删掉关键关系映射。"
+            "必须严格基于给定证据与来源。"
+            f"{format_instruction}"
         )
         evidence_block = "\n".join(f"- {line}" for line in evidence) if evidence else "- 无"
-        steps_block = "\n".join(f"{idx}. {line}" for idx, line in enumerate(steps, start=1))
+        key_points_block = (
+            "\n".join(f"- {line}" for line in (key_points or []) if str(line).strip())
+            if key_points
+            else "- 无"
+        )
+        steps_block = "\n".join(f"{idx}. {line}" for idx, line in enumerate(steps, start=1)) if steps else "- 无"
         citations_block = "\n".join(f"- {source}" for source in citation_sources) if citation_sources else "- 无"
+
         user_prompt = (
             f"用户问题：{query}\n\n"
+            f"回答模式：{answer_mode}\n\n"
             f"模板答案：\n{template_answer}\n\n"
+            f"可用要点：\n{key_points_block}\n\n"
             f"可用步骤：\n{steps_block}\n\n"
             f"可用证据：\n{evidence_block}\n\n"
             f"可用来源：\n{citations_block}\n\n"
-            "请输出最终答案。请勿包含多余说明。"
+            "请输出最终答案。要求：表达自然，关系映射完整，来源可追溯，不要添加任何未给出的新事实。"
         )
 
         url = self._safe_http_url(f"{self.base_url}/chat/completions")

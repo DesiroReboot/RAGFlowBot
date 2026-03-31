@@ -34,10 +34,10 @@ class KBaseManager:
         raw = f"{normalized}|{file_hash}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-    def sync_configured_source(self) -> dict[str, Any]:
-        return self.builder.sync(self.config.source_dir)
+    def sync_configured_source(self, *, force_reindex: bool = False) -> dict[str, Any]:
+        return self.builder.sync(self.config.source_dir, force_reindex=force_reindex)
 
-    def scan_and_process(self, source_dir: str) -> dict[str, Any]:
+    def scan_and_process(self, source_dir: str, *, force_reindex: bool = False) -> dict[str, Any]:
         if not Path(source_dir).exists():
             return {
                 "processed": 0,
@@ -49,7 +49,7 @@ class KBaseManager:
                 "indexed_chunks": self.indexer.get_index_stats()["indexed_chunks"],
                 "partial_files": 0,
             }
-        return self.builder.sync(source_dir)
+        return self.builder.sync(source_dir, force_reindex=force_reindex)
 
     def search(self, query: str, limit: int = 10) -> list[dict[str, Any]]:
         return self.indexer.search(query, limit)

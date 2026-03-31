@@ -120,6 +120,40 @@ def test_context_selector_soft_quota_prefers_high_value_source() -> None:
     assert citations
 
 
+def test_context_selector_unbounded_allows_single_source_dominance() -> None:
+    selector = ContextSelector(source_quota_mode="unbounded")
+    candidates = [
+        {
+            "file_uuid": "a",
+            "chunk_id": idx,
+            "source": "dominant.pdf",
+            "source_path": "/kb/dominant.pdf",
+            "content": f"dominant-{idx}",
+            "score": 1.0 - idx * 0.02,
+        }
+        for idx in range(6)
+    ] + [
+        {
+            "file_uuid": "b",
+            "chunk_id": idx,
+            "source": "other.txt",
+            "source_path": "/kb/other.txt",
+            "content": f"other-{idx}",
+            "score": 0.2 - idx * 0.01,
+        }
+        for idx in range(3)
+    ]
+    source_scores = [
+        {"source": "dominant.pdf", "score": 0.9, "doc_evidence_mass_norm": 1.0},
+        {"source": "other.txt", "score": 0.8, "doc_evidence_mass_norm": 0.9},
+    ]
+    selected, _ = selector.select(candidates=candidates, source_scores=source_scores, top_k=4)
+
+    assert len(selected) == 4
+    assert all(row["source"] == "dominant.pdf" for row in selected)
+    assert selector.last_source_quotas["dominant.pdf"] == 4
+
+
 def test_canonical_source_groups_pdf_and_txt_versions() -> None:
     citations = build_grouped_citations(
         [
@@ -214,3 +248,82 @@ def test_grader_source_theme_boost_prefers_matching_source() -> None:
     )
     assert candidates[0]["source"] == "04-报关物流-fbcc42e5c3.pdf"
     assert candidates[0]["grading"]["source_theme_boost"] > 0
+
+
+def test_grader_formula_structure_boost_prefers_formula_chunk() -> None:
+    grader = ResultGrader()
+    fused_results = [
+        {
+            "file_uuid": "same-doc",
+            "chunk_id": 7,
+            "source": "02-报价与合同-85b65205a7.pdf",
+            "source_path": "/kb/02-报价与合同-85b65205a7.pdf",
+            "doc_type": "pdf",
+            "doc_chunk_count": 20,
+            "content": "CIF价格 = FOB价格 + 国际海运费 + 海运保险费",
+            "rrf_score": 0.08,
+            "fts_rank": 1,
+            "vec_similarity": 0.65,
+        },
+        {
+            "file_uuid": "same-doc",
+            "chunk_id": 11,
+            "source": "02-报价与合同-85b65205a7.pdf",
+            "source_path": "/kb/02-报价与合同-85b65205a7.pdf",
+            "doc_type": "pdf",
+            "doc_chunk_count": 20,
+            "content": "FOB价格 = EXW价格 + 国内运费 + 报关费 + 装船费 + 港口杂费",
+            "rrf_score": 0.07,
+            "fts_rank": 2,
+            "vec_similarity": 0.05,
+        },
+    ]
+    candidates, _ = grader.grade(
+        query_tokens=["fob", "价格组成", "公式"],
+        fused_results=fused_results,
+    )
+
+    assert len(candidates) == 2
+    by_chunk = {int(row["chunk_id"]): row for row in candidates}
+    assert by_chunk[11]["grading"]["formula_boost"] > by_chunk[7]["grading"]["formula_boost"]
+    assert by_chunk[11]["score"] > by_chunk[7]["score"]
+
+
+def test_grader_qa_anchor_beats_keyword_only_match_for_fob_composition() -> None:
+    grader = ResultGrader()
+    fused_results = [
+        {
+            "file_uuid": "same-doc",
+            "chunk_id": 3,
+            "source": "02-报价与合同-85b65205a7.pdf",
+            "source_path": "/kb/02-报价与合同-85b65205a7.pdf",
+            "doc_type": "pdf",
+            "doc_chunk_count": 20,
+            "content": "FOB报价会受汇率和市场波动影响，实际报价要结合利润率评估。",
+            "rrf_score": 0.09,
+            "fts_rank": 1,
+            "vec_similarity": 0.78,
+        },
+        {
+            "file_uuid": "same-doc",
+            "chunk_id": 8,
+            "source": "02-报价与合同-85b65205a7.pdf",
+            "source_path": "/kb/02-报价与合同-85b65205a7.pdf",
+            "doc_type": "pdf",
+            "doc_chunk_count": 20,
+            "content": "FOB价格 = EXW价格 + 国内运费 + 报关费 + 装船费 + 港口杂费",
+            "rrf_score": 0.07,
+            "fts_rank": 2,
+            "vec_similarity": 0.12,
+        },
+    ]
+    candidates, _ = grader.grade(
+        query_tokens=["fob", "价格组成", "公式"],
+        fused_results=fused_results,
+    )
+
+    assert len(candidates) == 2
+    by_chunk = {int(row["chunk_id"]): row for row in candidates}
+    assert by_chunk[8]["grading"]["qa_anchor_boost"] > by_chunk[3]["grading"]["qa_anchor_boost"]
+    assert by_chunk[3]["grading"]["semantic_guard_penalty"] >= by_chunk[8]["grading"]["semantic_guard_penalty"]
+    assert by_chunk[8]["score"] > by_chunk[3]["score"]

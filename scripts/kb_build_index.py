@@ -47,12 +47,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Build or refresh KB index.")
     parser.add_argument("--config", default=None, help="Config file path. Defaults to config/config.json")
     parser.add_argument("--source-dir", default=None, help="Override knowledge base source directory")
+    parser.add_argument(
+        "--force-reindex",
+        action="store_true",
+        help="Rebuild index for all scanned files even when file hash is unchanged",
+    )
     args = parser.parse_args()
 
     config = Config(args.config)
     kbase_config = _build_kbase_config(config, args.source_dir)
     manager = KBaseManager(kbase_config)
-    result = manager.scan_and_process(kbase_config.source_dir)
+    result = manager.scan_and_process(
+        kbase_config.source_dir,
+        force_reindex=bool(args.force_reindex),
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
     failed = int(result.get("failed", 0) or 0)

@@ -9,6 +9,7 @@ from typing import Any
 
 from src.config import Config
 from src.fastapi_gateway.services.event_service import FeishuEventService
+from src.RAG.startup_bootstrap import KBaseStartupBootstrap
 
 
 def _health_file_path() -> Path:
@@ -101,6 +102,8 @@ def _to_event_payload(data: Any) -> dict[str, Any]:
 
 def run_long_connection_client(config: Config | None = None) -> None:
     cfg = config or Config()
+    # Keep long_connection behavior consistent with webhook startup hooks.
+    KBaseStartupBootstrap(cfg).start()
     service = FeishuEventService(cfg)
     _install_connection_health_handler()
     _write_connection_health("starting")

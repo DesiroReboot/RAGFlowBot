@@ -43,6 +43,10 @@ class RAGSearcher:
         embedding_batch_size: int = 10,
         embedding_timeout: int = 20,
         embedding_max_retries: int = 3,
+        source_quota_mode: str = "balanced",
+        max_chunks_per_source: int = 0,
+        qa_anchor_enabled: bool = True,
+        semantic_guard_enabled: bool = True,
     ):
         self.db_path = db_path
         self.top_k = top_k
@@ -68,8 +72,14 @@ class RAGSearcher:
         )
         self.hybrid = HybridRetriever(db_path, self.config)
         self.fusion = ReciprocalRankFusion(fusion_rrf_k)
-        self.grader = ResultGrader()
-        self.context_selector = ContextSelector()
+        self.grader = ResultGrader(
+            qa_anchor_enabled=qa_anchor_enabled,
+            semantic_guard_enabled=semantic_guard_enabled,
+        )
+        self.context_selector = ContextSelector(
+            source_quota_mode=source_quota_mode,
+            max_chunks_per_source=max_chunks_per_source,
+        )
 
     def search(self, query: str) -> list[SearchResult]:
         results, _ = self.search_with_trace(query)
@@ -294,6 +304,7 @@ class RAGSearcher:
         selected_by_source: dict[str, int] = {}
         selected_content: set[str] = set()
         source_quotas = getattr(self.context_selector, "last_source_quotas", {})
+        source_quota_mode = str(getattr(self.context_selector, "source_quota_mode", "balanced"))
         for item in selected_results:
             source = str(item.get("source", ""))
             selected_by_source[source] = selected_by_source.get(source, 0) + 1
@@ -307,7 +318,9 @@ class RAGSearcher:
             source = str(item.get("source", ""))
             content_key = str(item.get("content", "")).strip()
             reason = "score_or_source_priority"
-            if selected_by_source.get(source, 0) >= int(source_quotas.get(source, 1)):
+            if source_quota_mode != "unbounded" and selected_by_source.get(source, 0) >= int(
+                source_quotas.get(source, 1)
+            ):
                 reason = "source_soft_quota_reached"
             elif content_key in selected_content:
                 reason = "duplicate_content"
@@ -338,6 +351,7 @@ class RAGSearcher:
                 "hard_filtered_total": len(hard_filtered or []),
                 "conflict_pool_total": len(conflict_pool or []),
                 "source_quotas": source_quotas,
+                "source_quota_mode": source_quota_mode,
             },
             "branch_contribution": branch_contribution,
             "eliminated_candidates": eliminated_candidates,

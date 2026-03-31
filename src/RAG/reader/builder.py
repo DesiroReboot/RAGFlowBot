@@ -55,7 +55,7 @@ class KnowledgeBaseBuilder:
         self.file_mapper = FileMapper(config.db_path, ensure_db_schema=False)
         self.manifest_store = ManifestStore(config.db_path, ensure_schema=False)
 
-    def sync(self, source_dir: str | None = None) -> dict[str, Any]:
+    def sync(self, source_dir: str | None = None, *, force_reindex: bool = False) -> dict[str, Any]:
         source_root = source_dir or self.config.source_dir
         files = self.scanner.scan(source_root)
         if not files:
@@ -94,7 +94,8 @@ class KnowledgeBaseBuilder:
                 existing = self.file_mapper.get_file_by_path(str(file_path))
                 has_chunks = self.file_mapper.count_ready_chunks(file_uuid) > 0
                 if (
-                    existing
+                    not force_reindex
+                    and existing
                     and str(existing.get("file_hash", "")) == parsed.file_hash
                     and has_chunks
                     and str(existing.get("index_status", "ready")) in {"ready", "partial"}
@@ -196,11 +197,25 @@ class KnowledgeBaseBuilder:
         stats = self.indexer.get_index_stats()
         summary["indexed_files"] = stats["indexed_files"]
         summary["indexed_chunks"] = stats["indexed_chunks"]
-        status = "ready"
-        if summary["failed"] > 0:
-            status = "failed" if summary["updated"] == 0 else "partial"
-        elif summary["partial_files"] > 0:
-            status = "partial"
+        has_retrieval_rows = any(
+            int(stats.get(key, 0) or 0) > 0
+            for key in ("indexed_chunks", "fts_documents", "vec_rows")
+        )
+        if not has_retrieval_rows:
+            # Prevent false "ready" when the source dir is missing or all chunks are dropped.
+            attempted = (
+                int(summary.get("processed", 0) or 0) > 0
+                or int(summary.get("updated", 0) or 0) > 0
+                or int(summary.get("failed", 0) or 0) > 0
+                or bool(summary.get("errors", []))
+            )
+            status = "failed" if attempted else "empty"
+        else:
+            status = "ready"
+            if summary["failed"] > 0:
+                status = "failed" if summary["updated"] == 0 else "partial"
+            elif summary["partial_files"] > 0:
+                status = "partial"
 
         last_error = summary["errors"][-1] if summary["errors"] else None
         self.manifest_store.upsert_manifest(

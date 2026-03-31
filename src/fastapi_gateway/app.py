@@ -8,6 +8,7 @@ from src.fastapi_gateway.routes.health import create_health_router
 from src.fastapi_gateway.routes.startup_check import create_startup_check_router
 from src.fastapi_gateway.routes.webhook import create_webhook_router
 from src.fastapi_gateway.services.event_service import FeishuEventService
+from src.RAG.startup_bootstrap import KBaseStartupBootstrap
 
 
 def create_app(
@@ -32,4 +33,9 @@ def create_app(
     app.include_router(create_startup_check_router(service))
     app.include_router(create_diagnostics_router(service))
     app.include_router(create_webhook_router(webhook_path, service))
+
+    @app.on_event("startup")
+    def _kb_startup_init() -> None:
+        # Opt-in KB init; honors blocking/fail-open settings in config.
+        KBaseStartupBootstrap(cfg).start()
     return app

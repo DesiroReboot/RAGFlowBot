@@ -48,6 +48,20 @@ class ResultGrader:
         "openai.com",
         "wikipedia.org",
     )
+    _RELATION_QUERY_MARKERS = (
+        "组成",
+        "构成",
+        "公式",
+        "计算",
+        "等于",
+        "包含",
+        "报价",
+        "price composition",
+        "formula",
+        "compose",
+    )
+    _RELATION_CONNECTORS = ("=", "+", "组成", "构成", "包括", "由", "等于", "包含", "含")
+    _INCOTERM_MARKERS = ("fob", "cfr", "cif", "exw")
 
     def __init__(
         self,
@@ -55,10 +69,14 @@ class ResultGrader:
         min_evidence_score: float = 0.26,
         min_freshness_temporal: float = 0.32,
         conflict_pool_threshold: float = 0.82,
+        qa_anchor_enabled: bool = True,
+        semantic_guard_enabled: bool = True,
     ) -> None:
         self.min_evidence_score = _clamp(min_evidence_score)
         self.min_freshness_temporal = _clamp(min_freshness_temporal)
         self.conflict_pool_threshold = _clamp(conflict_pool_threshold)
+        self.qa_anchor_enabled = bool(qa_anchor_enabled)
+        self.semantic_guard_enabled = bool(semantic_guard_enabled)
         self.last_hard_filtered: list[dict[str, Any]] = []
         self.last_conflict_pool: list[dict[str, Any]] = []
 
@@ -140,6 +158,20 @@ class ResultGrader:
                 doc_type=doc_type,
                 query_theme_hints=theme_hints,
             )
+            formula_boost = self._formula_structure_boost(
+                content=content,
+                query_tokens=query_tokens,
+            )
+            qa_anchor_boost = (
+                self._qa_anchor_boost(content=content, query_tokens=query_tokens)
+                if self.qa_anchor_enabled
+                else 0.0
+            )
+            semantic_guard_penalty = (
+                self._semantic_guard_penalty(content=content, query_tokens=query_tokens)
+                if self.semantic_guard_enabled
+                else 0.0
+            )
             content_hash = str(item.get("content_hash") or hash(content))
             prior_score = content_hash_to_top_score.get(content_hash, 0.0)
             redundancy_penalty = 0.15 if prior_score > 0.75 else 0.0
@@ -155,8 +187,11 @@ class ResultGrader:
                 + 0.08 * freshness_score
                 + 0.06 * authority_score
                 + source_theme_boost
+                + formula_boost
+                + qa_anchor_boost
                 - redundancy_penalty
                 - noise_penalty
+                - semantic_guard_penalty
             )
             stance = self._conflict_stance(content_lower)
             pre_scored.append(
@@ -175,6 +210,9 @@ class ResultGrader:
                     "_rrf_norm": rrf_norm,
                     "_metadata_boost": metadata_boost,
                     "_source_theme_boost": source_theme_boost,
+                    "_formula_boost": formula_boost,
+                    "_qa_anchor_boost": qa_anchor_boost,
+                    "_semantic_guard_penalty": semantic_guard_penalty,
                     "_relevance_score": relevance_score,
                     "_evidence_score": evidence_score,
                     "_freshness_score": freshness_score,
@@ -282,6 +320,9 @@ class ResultGrader:
                     "overlap_score": round(float(item["_overlap"]), 6),
                     "metadata_boost": round(float(item["_metadata_boost"]), 6),
                     "source_theme_boost": round(float(item["_source_theme_boost"]), 6),
+                    "formula_boost": round(float(item["_formula_boost"]), 6),
+                    "qa_anchor_boost": round(float(item["_qa_anchor_boost"]), 6),
+                    "semantic_guard_penalty": round(float(item["_semantic_guard_penalty"]), 6),
                     "readability_score": round(float(item["_readability_score"]), 6),
                     "relevance_score": round(float(item["_relevance_score"]), 6),
                     "evidence_score": round(float(item["_evidence_score"]), 6),
@@ -309,6 +350,9 @@ class ResultGrader:
                 "_rrf_norm",
                 "_metadata_boost",
                 "_source_theme_boost",
+                "_formula_boost",
+                "_qa_anchor_boost",
+                "_semantic_guard_penalty",
                 "_relevance_score",
                 "_evidence_score",
                 "_freshness_score",
@@ -542,3 +586,132 @@ class ResultGrader:
         if boost > 0 and doc_type == "pdf":
             boost += 0.04
         return min(0.28, boost)
+
+    def _formula_structure_boost(self, *, content: str, query_tokens: list[str]) -> float:
+        lowered_content = str(content or "").lower()
+        if not lowered_content:
+            return 0.0
+
+        formula_intent = any(
+            ("公式" in str(token))
+            or ("组成" in str(token))
+            or ("计算" in str(token))
+            or ("报价" in str(token))
+            for token in query_tokens
+        )
+        if not formula_intent:
+            return 0.0
+        if "=" not in content or "+" not in content:
+            return 0.0
+
+        domestic_cost_markers = (
+            "国内运费",
+            "报关费",
+            "装船费",
+            "港口杂费",
+        )
+        domestic_hits = sum(1 for marker in domestic_cost_markers if marker in content)
+        # Strongly prioritize canonical FOB composition formulas when users ask "组成/公式/计算".
+        if "fob" in lowered_content and "exw" in lowered_content:
+            if domestic_hits >= 3:
+                return 0.36
+            if domestic_hits >= 2:
+                return 0.28
+
+        component_markers = (
+            "fob",
+            "exw",
+            "国内运费",
+            "报关费",
+            "装船费",
+            "港口杂费",
+            "国际海运费",
+            "海运保险费",
+        )
+        hits = sum(1 for marker in component_markers if marker in lowered_content or marker in content)
+        if hits >= 6:
+            return 0.18
+        if hits >= 4:
+            return 0.12
+        return 0.0
+
+    def _has_relation_intent(self, query_tokens: list[str]) -> bool:
+        if not query_tokens:
+            return False
+        lowered_tokens = [str(token).lower() for token in query_tokens]
+        return any(
+            any(marker in token for marker in self._RELATION_QUERY_MARKERS)
+            for token in lowered_tokens
+        )
+
+    def _qa_anchor_boost(self, *, content: str, query_tokens: list[str]) -> float:
+        if not self._has_relation_intent(query_tokens):
+            return 0.0
+        text = str(content or "")
+        lowered = text.lower()
+        if not lowered:
+            return 0.0
+
+        has_equation = bool(re.search(r"(fob|cfr|cif|exw)\s*[:=：]", lowered))
+        has_relation_connector = any(marker in text or marker in lowered for marker in self._RELATION_CONNECTORS)
+
+        boost = 0.0
+        if has_equation:
+            boost += 0.08
+        if has_relation_connector:
+            boost += 0.06
+
+        if ("fob" in lowered and "exw" in lowered) and (
+            ("国内运费" in text)
+            or ("报关费" in text)
+            or ("装船费" in text)
+            or ("港口杂费" in text)
+            or ("inland freight" in lowered)
+            or ("customs fee" in lowered)
+        ):
+            boost += 0.20
+
+        if ("cfr" in lowered and "fob" in lowered) and (
+            ("国际海运费" in text) or ("sea freight" in lowered)
+        ):
+            boost += 0.16
+
+        if ("cif" in lowered and ("fob" in lowered or "cfr" in lowered)) and (
+            ("海运保险费" in text) or ("insurance" in lowered)
+        ):
+            boost += 0.14
+
+        return min(0.34, boost)
+
+    def _semantic_guard_penalty(self, *, content: str, query_tokens: list[str]) -> float:
+        if not self._has_relation_intent(query_tokens):
+            return 0.0
+        text = str(content or "")
+        lowered = text.lower()
+        if not lowered:
+            return 0.0
+
+        query_incoterms = {token.lower() for token in query_tokens if token.lower() in self._INCOTERM_MARKERS}
+        content_incoterms = {term for term in self._INCOTERM_MARKERS if term in lowered}
+        has_relation_connector = any(marker in text or marker in lowered for marker in self._RELATION_CONNECTORS)
+
+        if has_relation_connector and content_incoterms:
+            return 0.0
+
+        hit_query_terms = sum(1 for token in query_tokens if token and str(token).lower() in lowered)
+        mentions_pricing_words = any(
+            marker in lowered
+            for marker in ("price", "quote", "报价", "价格", "费用", "成本", "fob", "cfr", "cif", "exw")
+        )
+        miss_target_relation = bool(query_incoterms & content_incoterms) or (
+            bool(query_incoterms) and not content_incoterms
+        )
+
+        penalty = 0.0
+        if mentions_pricing_words and not has_relation_connector:
+            penalty += 0.08
+        if hit_query_terms >= 2 and not has_relation_connector:
+            penalty += 0.06
+        if miss_target_relation and not has_relation_connector:
+            penalty += 0.08
+        return min(0.24, penalty)

@@ -108,6 +108,8 @@ class SearchConfig:
     vec_top_k: int = 20
     fusion_rrf_k: int = 60
     context_top_k: int = 6
+    source_quota_mode: str = "unbounded"
+    max_chunks_per_source: int = 0
     web_search_enabled: bool = False
     web_search_provider: str = "mock"
     web_search_timeout: int = 8
@@ -137,6 +139,9 @@ class SearchConfig:
     merge_evidence_search_top_k: int = 2
     search_progress_enabled: bool = True
     search_progress_keyword_top_k: int = 4
+    qa_anchor_enabled: bool = True
+    semantic_guard_enabled: bool = True
+    paragraph_output_enabled: bool = True
 
 
 @dataclass
@@ -162,13 +167,16 @@ class GenerationConfig:
     provider: str = "dashscope"
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     api_key: str = ""
-    model: str = "qwen-plus"
+    model: str = "qwen3-32b"
     temperature: float = 0.2
     timeout: int = 25
     max_retries: int = 2
     min_quality_score: float = 0.55
     min_claim_support_rate: float = 0.35
     min_citation_coverage: float = 0.6
+    default_answer_mode: str = "fact_qa"
+    force_point_source_format: bool = True
+    min_point_source_binding_rate: float = 1.0
 
 
 @dataclass
@@ -360,6 +368,23 @@ class Config:
             vec_top_k=int(_env("ECBOT_VEC_TOP_K", search_data.get("vec_top_k", 20))),
             fusion_rrf_k=int(_env("ECBOT_FUSION_RRF_K", search_data.get("fusion_rrf_k", 60))),
             context_top_k=int(_env("ECBOT_CONTEXT_TOP_K", search_data.get("context_top_k", 6))),
+            source_quota_mode=str(
+                _env(
+                    "ECBOT_SOURCE_QUOTA_MODE",
+                    search_data.get("source_quota_mode", "unbounded"),
+                )
+            )
+            .strip()
+            .lower(),
+            max_chunks_per_source=max(
+                0,
+                int(
+                    _env(
+                        "ECBOT_MAX_CHUNKS_PER_SOURCE",
+                        search_data.get("max_chunks_per_source", 0),
+                    )
+                ),
+            ),
             web_search_enabled=_as_bool(
                 _env("ECBOT_WEB_SEARCH_ENABLED", search_data.get("web_search_enabled", False)),
                 False,
@@ -465,6 +490,27 @@ class Config:
                     search_data.get("search_progress_keyword_top_k", 4),
                 )
             ),
+            qa_anchor_enabled=_as_bool(
+                _env(
+                    "ECBOT_QA_ANCHOR_ENABLED",
+                    search_data.get("qa_anchor_enabled", True),
+                ),
+                True,
+            ),
+            semantic_guard_enabled=_as_bool(
+                _env(
+                    "ECBOT_SEMANTIC_GUARD_ENABLED",
+                    search_data.get("semantic_guard_enabled", True),
+                ),
+                True,
+            ),
+            paragraph_output_enabled=_as_bool(
+                _env(
+                    "ECBOT_PARAGRAPH_OUTPUT_ENABLED",
+                    search_data.get("paragraph_output_enabled", True),
+                ),
+                True,
+            ),
         )
         self.database = DatabaseConfig(
             db_path=str(_env("ECBOT_DB_PATH", db_data.get("db_path", "DB/ec_bot.db")))
@@ -514,6 +560,27 @@ class Config:
                 _env(
                     "ECBOT_GENERATION_MIN_CITATION_COVERAGE",
                     generation_data.get("min_citation_coverage", 0.6),
+                )
+            ),
+            default_answer_mode=str(
+                _env(
+                    "ECBOT_GENERATION_DEFAULT_ANSWER_MODE",
+                    generation_data.get("default_answer_mode", "fact_qa"),
+                )
+            )
+            .strip()
+            .lower(),
+            force_point_source_format=_as_bool(
+                _env(
+                    "ECBOT_GENERATION_FORCE_POINT_SOURCE_FORMAT",
+                    generation_data.get("force_point_source_format", True),
+                ),
+                True,
+            ),
+            min_point_source_binding_rate=float(
+                _env(
+                    "ECBOT_GENERATION_MIN_POINT_SOURCE_BINDING_RATE",
+                    generation_data.get("min_point_source_binding_rate", 1.0),
                 )
             ),
         )
