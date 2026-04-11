@@ -41,6 +41,9 @@ def build_grouped_citations(items: list[Any]) -> list[dict[str, Any]]:
             source = str(item.get("source", "")).strip()
             path = str(item.get("source_path", "")).strip()
             score = float(item.get("score", 0.0))
+            doc_id = str(item.get("file_uuid", "")).strip()
+            chunk_id = int(item.get("chunk_id", 0) or 0)
+            text = str(item.get("content", "")).strip()
             canonical = str(item.get("canonical_source_id", "")).strip() or canonical_source_id(
                 source,
                 path,
@@ -49,13 +52,25 @@ def build_grouped_citations(items: list[Any]) -> list[dict[str, Any]]:
             source = str(getattr(item, "source", "")).strip()
             path = str(getattr(item, "source_path", "")).strip()
             score = float(getattr(item, "score", 0.0))
+            doc_id = str(getattr(item, "file_uuid", "")).strip()
+            chunk_id = int(getattr(item, "chunk_id", 0) or 0)
+            text = str(getattr(item, "content", "")).strip()
             canonical = canonical_source_id(source, path)
         if not source:
             continue
         canonical = canonical or source.lower()
         grouped.setdefault(canonical, [])
         if not any(row["source"] == source and row["path"] == path for row in grouped[canonical]):
-            grouped[canonical].append({"source": source, "path": path, "score": score})
+            grouped[canonical].append(
+                {
+                    "source": source,
+                    "path": path,
+                    "score": score,
+                    "doc_id": doc_id,
+                    "chunk_id": chunk_id,
+                    "text": text,
+                }
+            )
 
     citations: list[dict[str, Any]] = []
     for canonical, versions in grouped.items():
@@ -67,9 +82,21 @@ def build_grouped_citations(items: list[Any]) -> list[dict[str, Any]]:
                 "source": primary["source"],
                 "title": primary["source"],
                 "path": primary["path"],
+                "doc_id": primary.get("doc_id", ""),
+                "chunk_id": primary.get("chunk_id", 0),
+                "score": primary.get("score", 0.0),
+                "text": primary.get("text", ""),
                 "canonical_source_id": canonical,
                 "aliases": aliases,
-                "versions": [{"source": row["source"], "path": row["path"]} for row in versions],
+                "versions": [
+                    {
+                        "source": row["source"],
+                        "path": row["path"],
+                        "doc_id": row.get("doc_id", ""),
+                        "chunk_id": row.get("chunk_id", 0),
+                    }
+                    for row in versions
+                ],
                 "_primary_score": primary["score"],
             }
         )

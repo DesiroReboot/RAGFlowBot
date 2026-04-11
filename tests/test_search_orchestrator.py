@@ -49,6 +49,28 @@ class _StubRAGSearcher:
         )
 
 
+class _StubRAGFlowSearcher:
+    def __init__(self) -> None:
+        self.called = 0
+
+    def search_with_trace(self, query: str) -> tuple[list[SearchResult], dict[str, Any]]:  # noqa: ARG002
+        self.called += 1
+        return (
+            [
+                SearchResult(
+                    file_uuid="rf1",
+                    source="ragflow-doc",
+                    content="ragflow content",
+                    score=0.88,
+                    chunk_id=10,
+                    source_path="https://ragflow/doc/1",
+                    section_title="chunk-10",
+                )
+            ],
+            {"provider": "ragflow", "selected_count": 1},
+        )
+
+
 class _LowConfidenceRAGSearcher:
     def __init__(self) -> None:
         self.called = 0
@@ -345,3 +367,41 @@ def test_orchestrator_exposes_l1_and_route_decision_methods() -> None:
     assert l1_result.trace["l1"]["hit_count"] == 2
     assert decision.trigger_full_rag is False
     assert decision.reason_code == "LOW_RELEVANCE_GATE"
+
+
+def test_orchestrator_accepts_ragflow_searcher_contract() -> None:
+    rag_searcher = _StubRAGFlowSearcher()
+    planner = _StubPlanner(
+        output=PlannerOutput(
+            plan_id="plan-ragflow",
+            need_web_search=False,
+            source_route="kb_only",
+            fusion_strategy="none",
+            domain_relevance_score=0.9,
+            reasons=[],
+            retrieval_plan={"sources": [{"name": "ragflow", "enabled": True}]},
+        )
+    )
+    orchestrator = SearchOrchestrator(
+        planner=planner,
+        rag_searcher=rag_searcher,
+        web_searcher=None,
+        config=SimpleNamespace(
+            search=SimpleNamespace(
+                l1_trigger_threshold=0.2,
+                l2_max_top_k=4,
+                phase_a_rag_confidence_threshold=0.2,
+                web_search_enabled=False,
+                web_rag_max_docs=4,
+                web_search_provider="mock",
+            )
+        ),
+        query_analyzer=_NoWebAnalyzer(),
+        web_result_evaluator=None,
+        web_router=None,
+    )
+
+    result = orchestrator.search_with_trace("policy")
+    assert rag_searcher.called == 1
+    assert len(result.hits) == 1
+    assert result.hits[0].source == "ragflow-doc"

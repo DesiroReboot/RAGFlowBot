@@ -48,6 +48,18 @@ def _as_dict(value: Any, default: dict[str, Any]) -> dict[str, Any]:
     return dict(default)
 
 
+def _as_str_dict(value: Any, default: dict[str, str]) -> dict[str, str]:
+    merged: dict[str, str] = dict(default)
+    raw = _as_dict(value, {})
+    for key, item in raw.items():
+        key_text = str(key).strip()
+        item_text = str(item).strip()
+        if not key_text or not item_text:
+            continue
+        merged[key_text] = item_text
+    return merged
+
+
 def _env(name: str, default: Any) -> Any:
     return os.getenv(name, default)
 
@@ -103,6 +115,7 @@ def _load_env_layers() -> None:
 
 @dataclass
 class SearchConfig:
+    rag_provider: str = "legacy"
     rag_top_k: int = 5
     fts_top_k: int = 20
     vec_top_k: int = 20
@@ -181,7 +194,7 @@ class GenerationConfig:
 
 @dataclass
 class KnowledgeBaseConfig:
-    source_dir: str = r"E:\DATA\外贸电商知识库"
+    source_dir: str = r"E:\知识库\RailKB"
     supported_extensions: tuple[str, ...] = (".md", ".txt", ".pdf")
     auto_sync_on_startup: bool = False
     auto_init_on_startup: bool = False
@@ -239,8 +252,20 @@ class EvaluationConfig:
     html_dir: str = "Eval/HTML"
 
 
+@dataclass
+class RagFlowConfig:
+    base_url: str = ""
+    api_key: str = ""
+    dataset_map: dict[str, str] = field(default_factory=dict)
+    timeout_ms: int = 2500
+    top_k: int = 5
+    min_score: float = 0.1
+    fallback_to_legacy: bool = True
+
+
 class Config:
     DEFAULT_CONFIG_PATH = "config/config.json"
+    DEFAULT_KB_SOURCE_DIR = r"E:\知识库\RailKB"
 
     def __init__(self, config_path: str | None = None):
         _load_env_layers()
@@ -257,6 +282,7 @@ class Config:
         data = self._load_json(self.config_path)
 
         search_data = data.get("search", {})
+        ragflow_data = data.get("ragflow", {})
         db_data = data.get("database", {})
         embedding_data = data.get("embedding", {})
         generation_data = data.get("generation", {})
@@ -361,8 +387,26 @@ class Config:
             ),
             True,
         )
+        shared_model_name = str(_env("ECBOT_MODEL", "")).strip()
+        embedding_model_default = str(embedding_data.get("model", "text-embedding-v4")).strip()
+        generation_model_default = str(generation_data.get("model", "qwen-plus")).strip()
+        resolved_embedding_model = str(
+            _env(
+                "ECBOT_EMBEDDING_MODEL",
+                shared_model_name or embedding_model_default,
+            )
+        ).strip()
+        resolved_generation_model = str(
+            _env(
+                "ECBOT_GENERATION_MODEL",
+                shared_model_name or generation_model_default,
+            )
+        ).strip()
 
         self.search = SearchConfig(
+            rag_provider=str(_env("ECBOT_RAG_PROVIDER", search_data.get("rag_provider", "legacy")))
+            .strip()
+            .lower(),
             rag_top_k=int(_env("ECBOT_RAG_TOP_K", search_data.get("rag_top_k", 5))),
             fts_top_k=int(_env("ECBOT_FTS_TOP_K", search_data.get("fts_top_k", 20))),
             vec_top_k=int(_env("ECBOT_VEC_TOP_K", search_data.get("vec_top_k", 20))),
@@ -519,7 +563,7 @@ class Config:
             provider=str(_env("ECBOT_EMBEDDING_PROVIDER", embedding_data.get("provider", "dashscope"))),
             base_url=str(_env("ECBOT_EMBEDDING_BASE_URL", embedding_data.get("base_url", "https://dashscope.aliyuncs.com/compatible-mode/v1"))),
             api_key=str(_env("ECBOT_EMBEDDING_API_KEY", embedding_data.get("api_key", ""))),
-            model=str(_env("ECBOT_EMBEDDING_MODEL", embedding_data.get("model", "text-embedding-v4"))),
+            model=resolved_embedding_model,
             dimension=int(_env("ECBOT_EMBEDDING_DIMENSION", embedding_data.get("dimension", 768))),
             batch_size=int(_env("ECBOT_EMBEDDING_BATCH_SIZE", embedding_data.get("batch_size", 10))),
             timeout=int(_env("ECBOT_EMBEDDING_TIMEOUT", embedding_data.get("timeout", 20))),
@@ -540,7 +584,7 @@ class Config:
                     generation_data.get("api_key", embedding_data.get("api_key", "")),
                 )
             ),
-            model=str(_env("ECBOT_GENERATION_MODEL", generation_data.get("model", "qwen-plus"))),
+            model=resolved_generation_model,
             temperature=float(_env("ECBOT_GENERATION_TEMPERATURE", generation_data.get("temperature", 0.2))),
             timeout=int(_env("ECBOT_GENERATION_TIMEOUT", generation_data.get("timeout", 25))),
             max_retries=int(_env("ECBOT_GENERATION_MAX_RETRIES", generation_data.get("max_retries", 2))),
@@ -585,7 +629,12 @@ class Config:
             ),
         )
         self.knowledge_base = KnowledgeBaseConfig(
-            source_dir=str(_env("ECBOT_KB_SOURCE_DIR", knowledge_base_data.get("source_dir", r"E:\DATA\外贸电商知识库"))),
+            source_dir=str(
+                _env(
+                    "ECBOT_KB_SOURCE_DIR",
+                    knowledge_base_data.get("source_dir", self.DEFAULT_KB_SOURCE_DIR),
+                )
+            ),
             supported_extensions=_as_tuple(
                 knowledge_base_data.get("supported_extensions"),
                 (".md", ".txt", ".pdf"),
@@ -676,6 +725,30 @@ class Config:
             report_dir=str(evaluation_data.get("report_dir", "Eval/report")),
             trace_dir=str(evaluation_data.get("trace_dir", "Eval/trace")),
             html_dir=str(evaluation_data.get("html_dir", "Eval/HTML")),
+        )
+        self.ragflow = RagFlowConfig(
+            base_url=str(_env("ECBOT_RAGFLOW_BASE_URL", ragflow_data.get("base_url", ""))).strip(),
+            api_key=str(_env("ECBOT_RAGFLOW_API_KEY", ragflow_data.get("api_key", ""))).strip(),
+            dataset_map=_as_str_dict(
+                _env("ECBOT_RAGFLOW_DATASET_MAP", ragflow_data.get("dataset_map", {})),
+                {},
+            ),
+            timeout_ms=max(
+                200,
+                int(_env("ECBOT_RAGFLOW_TIMEOUT_MS", ragflow_data.get("timeout_ms", 2500))),
+            ),
+            top_k=max(
+                1,
+                int(_env("ECBOT_RAGFLOW_TOP_K", ragflow_data.get("top_k", 5))),
+            ),
+            min_score=float(_env("ECBOT_RAGFLOW_MIN_SCORE", ragflow_data.get("min_score", 0.1))),
+            fallback_to_legacy=_as_bool(
+                _env(
+                    "ECBOT_RAGFLOW_FALLBACK_TO_LEGACY",
+                    ragflow_data.get("fallback_to_legacy", True),
+                ),
+                True,
+            ),
         )
 
     def _load_json(self, path_str: str) -> dict[str, Any]:

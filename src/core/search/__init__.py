@@ -1,5 +1,7 @@
 from .query_analyzer import QueryAnalysis, QueryAnalyzer
-from .rag_search import RAGSearcher, SearchResult
+from .rag_search import LegacyRAGSearcher, RAGSearcher, SearchResult
+from .ragflow_client import RAGFlowChunk, RAGFlowClient, RAGFlowSearchResponse
+from .ragflow_searcher import RAGFlowSearcher
 from .planner import FusionStrategy, Planner, PlannerOutput, RulePlanner, SourceRoute
 from .orchestrator import (
     L1Result,
@@ -16,6 +18,11 @@ from .web_search_client import WebSearchClient, WebSearchResult
 
 __all__ = [
     "RAGSearcher",
+    "LegacyRAGSearcher",
+    "RAGFlowSearcher",
+    "RAGFlowClient",
+    "RAGFlowChunk",
+    "RAGFlowSearchResponse",
     "SearchResult",
     "Planner",
     "RulePlanner",

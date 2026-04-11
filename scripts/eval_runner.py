@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from collections import Counter
@@ -22,6 +22,16 @@ from src.core.bot_agent import ReActAgent  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _configure_utf8_stdio() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 @dataclass
@@ -49,6 +59,7 @@ class EvalResult:
     citations: List[Dict[str, Any]] = field(default_factory=list)
     must_source_recall: float = 0.0
     source_precision: float = 0.0
+    source_precision_applicable: bool = True
     must_keyword_coverage: float = 0.0
     should_keyword_coverage: float = 0.0
     keyword_score: float = 0.0
@@ -60,6 +71,7 @@ class EvalResult:
     answer_completeness: float = 0.0
     instruction_following_rate: float = 0.0
     actionability_score: float = 0.0
+    actionability_applicable: bool = True
     generation_quality_score: float = 0.0
     pass_rate_at_n: float = 1.0
     pass_count: int = 1
@@ -80,6 +92,7 @@ class EvalSummary:
     total_items: int = 0
     must_source_recall_avg: float = 0.0
     source_precision_avg: float = 0.0
+    source_precision_applicable_items: int = 0
     must_keyword_coverage_avg: float = 0.0
     should_keyword_coverage_avg: float = 0.0
     keyword_score_avg: float = 0.0
@@ -91,6 +104,7 @@ class EvalSummary:
     answer_completeness_avg: float = 0.0
     instruction_following_rate_avg: float = 0.0
     actionability_score_avg: float = 0.0
+    actionability_applicable_items: int = 0
     generation_quality_score_avg: float = 0.0
     pass_rate_at_n_avg: float = 1.0
     repeat_runs: int = 1
@@ -114,11 +128,26 @@ class EvalChecker:
 
     def load_golden_set(self, path: str) -> List[GoldenItem]:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            raw_items = data.get("items", [])
+        elif isinstance(data, list):
+            raw_items = data
+        else:
+            raise ValueError(f"Unsupported golden-set payload type: {type(data).__name__}")
         items: List[GoldenItem] = []
-        for item in data:
+        for index, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                logger.warning("Skipping non-dict golden item at index %s", index)
+                continue
             expected_block = item.get("expected", {})
-            expected_keywords = item.get("expected_keywords", expected_block.get("keywords", []))
-            expected_sources = item.get("expected_sources", expected_block.get("sources", []))
+            expected_keywords = item.get(
+                "expected_keywords",
+                expected_block.get("keywords", expected_block.get("keywords_required", [])),
+            )
+            expected_sources = item.get(
+                "expected_sources",
+                expected_block.get("sources", expected_block.get("evidence_set", [])),
+            )
             forbidden_claims = expected_block.get("forbidden_claims", item.get("forbidden_claims", []))
             rubric = item.get("rubric", {})
             if isinstance(expected_keywords, list):
@@ -138,12 +167,14 @@ class EvalChecker:
                     "equivalent_sources": expected_sources.get("equivalent_sources", []),
                     "source_aliases": expected_sources.get("source_aliases", {}),
                 }
+            expected_sources["must"] = self._normalize_expected_source_list(expected_sources.get("must", []))
+            expected_sources["should"] = self._normalize_expected_source_list(expected_sources.get("should", []))
             items.append(GoldenItem(
-                id=item["id"],
-                question=item["question"],
-                scenario=item.get("scenario", "unknown"),
-                difficulty=item.get("difficulty", "medium"),
-                source_of_question=item.get("source_of_question", "synthetic"),
+                id=str(item.get("id", f"item-{index + 1:04d}")),
+                question=str(item.get("question", item.get("query", ""))),
+                scenario=item.get("scenario", item.get("task_type", "unknown")),
+                difficulty=item.get("difficulty", item.get("slices", {}).get("difficulty", "medium")),
+                source_of_question=item.get("source_of_question", item.get("source", "synthetic")),
                 expected_keywords=expected_keywords,
                 expected_sources=expected_sources,
                 rubric=rubric if isinstance(rubric, dict) else {},
@@ -152,6 +183,24 @@ class EvalChecker:
             ))
         logger.info("Loaded %s golden set items from %s", len(items), path)
         return items
+
+    @staticmethod
+    def _normalize_expected_source_list(raw_sources: List[Any]) -> List[str]:
+        normalized: List[str] = []
+        for value in raw_sources:
+            if isinstance(value, str):
+                text = value.strip()
+                if text:
+                    normalized.append(text)
+                continue
+            if not isinstance(value, dict):
+                continue
+            for key in ("source", "source_id", "title", "doc_id", "id"):
+                token = str(value.get(key, "")).strip()
+                if token:
+                    normalized.append(token)
+                    break
+        return normalized
 
     def validate_expected_sources(self, items: List[GoldenItem]) -> Dict[str, Any]:
         indexed_sources = self._load_indexed_sources()
@@ -221,7 +270,7 @@ class EvalChecker:
 
         latency = time.time() - started
         retrieved_sources = [row.get("source", "") for row in agent_trace.get("search", {}).get("final_results", []) if row.get("source")]
-        must_source_recall, source_precision = self.calculate_source_metrics(retrieved_sources, item.expected_sources)
+        must_source_recall, source_precision, source_precision_applicable = self.calculate_source_metrics(retrieved_sources, item.expected_sources)
         must_cov, should_cov, keyword_score, matched_must, matched_should = self.calculate_keyword_coverage(answer, item.expected_keywords)
         strict_hit, relaxed_hit = self.check_citation_validity(citations, item.expected_sources)
         claim_supported_rate, claim_citation_precision = self.calculate_claim_metrics(
@@ -241,11 +290,12 @@ class EvalChecker:
             rubric=item.rubric,
             forbidden_claims=item.forbidden_claims,
         )
-        actionability_score = self.calculate_actionability_score(answer)
+        actionability_applicable = self._is_actionability_applicable(item)
+        actionability_score = self.calculate_actionability_score(answer) if actionability_applicable else 0.0
         generation_quality_score = self.calculate_generation_quality_score(
             answer_completeness=answer_completeness,
             instruction_following_rate=instruction_following_rate,
-            actionability_score=actionability_score,
+            actionability_score=actionability_score if actionability_applicable else None,
         )
 
         issues = []
@@ -316,6 +366,7 @@ class EvalChecker:
             citations=citations,
             must_source_recall=must_source_recall,
             source_precision=source_precision,
+            source_precision_applicable=source_precision_applicable,
             must_keyword_coverage=must_cov,
             should_keyword_coverage=should_cov,
             keyword_score=keyword_score,
@@ -327,6 +378,7 @@ class EvalChecker:
             answer_completeness=answer_completeness,
             instruction_following_rate=instruction_following_rate,
             actionability_score=actionability_score,
+            actionability_applicable=actionability_applicable,
             generation_quality_score=generation_quality_score,
             retrieved_sources=retrieved_sources,
             matched_must_keywords=matched_must,
@@ -351,6 +403,7 @@ class EvalChecker:
             "metrics": {
                 "must_source_recall": result.must_source_recall,
                 "source_precision": result.source_precision,
+                "source_precision_applicable": result.source_precision_applicable,
                 "must_keyword_coverage": result.must_keyword_coverage,
                 "should_keyword_coverage": result.should_keyword_coverage,
                 "keyword_score": result.keyword_score,
@@ -362,6 +415,7 @@ class EvalChecker:
                 "answer_completeness": result.answer_completeness,
                 "instruction_following_rate": result.instruction_following_rate,
                 "actionability_score": result.actionability_score,
+                "actionability_applicable": result.actionability_applicable,
                 "generation_quality_score": result.generation_quality_score,
                 "latency": result.latency,
             },
@@ -602,6 +656,7 @@ class EvalChecker:
         print("-" * 72)
         print(f"Must Source Recall:      {summary.must_source_recall_avg:.2%}")
         print(f"Source Precision:        {summary.source_precision_avg:.2%}")
+        print(f"Source Precision Scope:  {summary.source_precision_applicable_items}/{summary.total_items}")
         print(f"Must Keyword Coverage:   {summary.must_keyword_coverage_avg:.2%}")
         print(f"Should Keyword Coverage: {summary.should_keyword_coverage_avg:.2%}")
         print(f"Keyword Score:           {summary.keyword_score_avg:.2%}")
@@ -613,6 +668,7 @@ class EvalChecker:
         print(f"Answer Completeness:     {summary.answer_completeness_avg:.2%}")
         print(f"Instruction Following:   {summary.instruction_following_rate_avg:.2%}")
         print(f"Actionability Score:     {summary.actionability_score_avg:.2%}")
+        print(f"Actionability Scope:     {summary.actionability_applicable_items}/{summary.total_items}")
         print(f"Generation Quality:      {summary.generation_quality_score_avg:.2%}")
         print(f"Pass Rate@N (N={summary.repeat_runs}): {summary.pass_rate_at_n_avg:.2%}")
         print("-" * 72)
@@ -622,10 +678,11 @@ class EvalChecker:
         print(f"Quality gate enabled: {quality_gate_enabled}")
         print("=" * 72)
 
-    def calculate_source_metrics(self, retrieved_sources: List[str], expected_sources: Dict[str, Any]) -> Tuple[float, float]:
+    def calculate_source_metrics(self, retrieved_sources: List[str], expected_sources: Dict[str, Any]) -> Tuple[float, float, bool]:
         expanded = self._expand_sources(expected_sources)
         must_sources = expanded["must"]
         all_expected = expanded["all"]
+        source_precision_applicable = bool(all_expected)
         normalized_retrieved = [self._normalize_text(source) for source in retrieved_sources if str(source).strip()]
         if must_sources:
             matched_must = 0
@@ -635,7 +692,11 @@ class EvalChecker:
             must_source_recall = matched_must / len(must_sources)
         else:
             must_source_recall = 1.0
-        if normalized_retrieved:
+        # No expected source labels means precision is not applicable for this item.
+        # Use a neutral value to avoid false-low averages caused by label absence.
+        if not source_precision_applicable:
+            source_precision = 1.0
+        elif normalized_retrieved:
             matched_retrieved = 0
             for actual in normalized_retrieved:
                 if any(self._source_match(actual, expected) for expected in all_expected):
@@ -643,7 +704,7 @@ class EvalChecker:
             source_precision = matched_retrieved / len(normalized_retrieved)
         else:
             source_precision = 0.0
-        return must_source_recall, source_precision
+        return must_source_recall, source_precision, source_precision_applicable
 
     def calculate_keyword_coverage(self, answer: str, expected_keywords: Dict[str, List[str]]) -> Tuple[float, float, float, List[str], List[str]]:
         answer_lower = answer.lower()
@@ -801,10 +862,29 @@ class EvalChecker:
         *,
         answer_completeness: float,
         instruction_following_rate: float,
-        actionability_score: float,
+        actionability_score: Optional[float],
     ) -> float:
-        score = (float(answer_completeness) + float(instruction_following_rate) + float(actionability_score)) / 3.0
+        metrics = [float(answer_completeness), float(instruction_following_rate)]
+        if actionability_score is not None:
+            metrics.append(float(actionability_score))
+        score = sum(metrics) / max(len(metrics), 1)
         return round(max(0.0, min(1.0, score)), 4)
+
+    def _is_actionability_applicable(self, item: GoldenItem) -> bool:
+        scenario = str(item.scenario or "").strip().lower()
+        if scenario in {"type_a_fact_qa", "fact_qa"}:
+            return False
+        rubric = item.rubric if isinstance(item.rubric, dict) else {}
+        sections = [
+            str(section).strip().lower()
+            for section in rubric.get("must_have_sections", [])
+            if str(section).strip()
+        ]
+        if any(token in {"步骤", "执行建议", "step", "steps", "procedure"} for token in sections):
+            return True
+        if any(token in scenario for token in ("procedure", "workflow", "plan")):
+            return True
+        return False
 
     def _section_coverage(self, answer: str, sections: Any) -> Optional[float]:
         if not isinstance(sections, list):
@@ -847,13 +927,27 @@ class EvalChecker:
     def _split_claims(self, answer: str) -> List[str]:
         if not answer.strip():
             return []
-        raw_parts = re.split(r"[。！？；\n]+", answer.replace("\r", "\n"))
         claims: List[str] = []
-        for part in raw_parts:
-            claim = re.sub(r"\s+", " ", part).strip(" -\t")
-            if len(claim) < 8:
+        in_reference = False
+        for raw in answer.replace("\r", "\n").split("\n"):
+            line = str(raw).strip()
+            if not line:
                 continue
-            claims.append(claim)
+            if line.startswith("来源：") or line.lower().startswith("sources:"):
+                in_reference = True
+                continue
+            if in_reference:
+                continue
+            if re.match(r"^[-*]?\s*\[S\d+\]", line):
+                continue
+            lowered_line = line.lower()
+            if "| chunk#" in lowered_line or "| procedure" in lowered_line or "| reference" in lowered_line:
+                continue
+            for part in re.split(r"[。！？!?；;]+", line):
+                claim = re.sub(r"\s+", " ", part).strip(" -\t")
+                if len(claim) < 8:
+                    continue
+                claims.append(claim)
         return claims
 
     def _best_claim_support(
@@ -890,7 +984,13 @@ class EvalChecker:
             return EvalSummary()
         total = len(results)
         must_source_recall_avg = sum(r.must_source_recall for r in results) / total
-        source_precision_avg = sum(r.source_precision for r in results) / total
+        source_precision_items = [r for r in results if r.source_precision_applicable]
+        source_precision_applicable_items = len(source_precision_items)
+        source_precision_avg = (
+            sum(r.source_precision for r in source_precision_items) / source_precision_applicable_items
+            if source_precision_applicable_items
+            else 1.0
+        )
         must_keyword_coverage_avg = sum(r.must_keyword_coverage for r in results) / total
         should_keyword_coverage_avg = sum(r.should_keyword_coverage for r in results) / total
         keyword_score_avg = sum(r.keyword_score for r in results) / total
@@ -901,7 +1001,13 @@ class EvalChecker:
         hallucination_rate_avg = sum(r.hallucination_rate for r in results) / total
         answer_completeness_avg = sum(r.answer_completeness for r in results) / total
         instruction_following_rate_avg = sum(r.instruction_following_rate for r in results) / total
-        actionability_score_avg = sum(r.actionability_score for r in results) / total
+        actionability_items = [r for r in results if r.actionability_applicable]
+        actionability_applicable_items = len(actionability_items)
+        actionability_score_avg = (
+            sum(r.actionability_score for r in actionability_items) / actionability_applicable_items
+            if actionability_applicable_items
+            else 1.0
+        )
         generation_quality_score_avg = sum(r.generation_quality_score for r in results) / total
         pass_rate_at_n_avg = sum(r.pass_rate_at_n for r in results) / total
         latency_avg = sum(r.latency for r in results) / total
@@ -923,6 +1029,7 @@ class EvalChecker:
             total_items=total,
             must_source_recall_avg=round(must_source_recall_avg, 4),
             source_precision_avg=round(source_precision_avg, 4),
+            source_precision_applicable_items=source_precision_applicable_items,
             must_keyword_coverage_avg=round(must_keyword_coverage_avg, 4),
             should_keyword_coverage_avg=round(should_keyword_coverage_avg, 4),
             keyword_score_avg=round(keyword_score_avg, 4),
@@ -934,6 +1041,7 @@ class EvalChecker:
             answer_completeness_avg=round(answer_completeness_avg, 4),
             instruction_following_rate_avg=round(instruction_following_rate_avg, 4),
             actionability_score_avg=round(actionability_score_avg, 4),
+            actionability_applicable_items=actionability_applicable_items,
             generation_quality_score_avg=round(generation_quality_score_avg, 4),
             pass_rate_at_n_avg=round(pass_rate_at_n_avg, 4),
             repeat_runs=max(1, int(repeat_runs)),
@@ -951,10 +1059,23 @@ class EvalChecker:
         scenario_buckets: Dict[str, Dict[str, float]] = {}
         for scenario, items in bucket_results.items():
             count = len(items)
+            source_precision_items = [i for i in items if i.source_precision_applicable]
+            source_precision_avg = (
+                sum(i.source_precision for i in source_precision_items) / len(source_precision_items)
+                if source_precision_items
+                else 1.0
+            )
+            actionability_items = [i for i in items if i.actionability_applicable]
+            actionability_score_avg = (
+                sum(i.actionability_score for i in actionability_items) / len(actionability_items)
+                if actionability_items
+                else 1.0
+            )
             scenario_buckets[scenario] = {
                 "count": count,
                 "must_source_recall_avg": round(sum(i.must_source_recall for i in items) / count, 4),
-                "source_precision_avg": round(sum(i.source_precision for i in items) / count, 4),
+                "source_precision_avg": round(source_precision_avg, 4),
+                "source_precision_applicable_items": len(source_precision_items),
                 "must_keyword_coverage_avg": round(sum(i.must_keyword_coverage for i in items) / count, 4),
                 "strict_citation_rate": round(sum(1 for i in items if i.strict_citation_hit) / count, 4),
                 "relaxed_citation_rate": round(sum(1 for i in items if i.relaxed_citation_hit) / count, 4),
@@ -963,7 +1084,8 @@ class EvalChecker:
                 "hallucination_rate_avg": round(sum(i.hallucination_rate for i in items) / count, 4),
                 "answer_completeness_avg": round(sum(i.answer_completeness for i in items) / count, 4),
                 "instruction_following_rate_avg": round(sum(i.instruction_following_rate for i in items) / count, 4),
-                "actionability_score_avg": round(sum(i.actionability_score for i in items) / count, 4),
+                "actionability_score_avg": round(actionability_score_avg, 4),
+                "actionability_applicable_items": len(actionability_items),
                 "generation_quality_score_avg": round(sum(i.generation_quality_score for i in items) / count, 4),
                 "pass_rate_at_n_avg": round(sum(i.pass_rate_at_n for i in items) / count, 4),
             }
@@ -996,11 +1118,14 @@ class EvalChecker:
             "must_source_recall": round(result.must_source_recall, 4),
             "must_keyword_coverage": round(result.must_keyword_coverage, 4),
             "strict_citation_hit": bool(result.strict_citation_hit),
+            "source_precision": round(result.source_precision, 4),
+            "source_precision_applicable": bool(result.source_precision_applicable),
             "claim_supported_rate": round(result.claim_supported_rate, 4),
             "hallucination_rate": round(result.hallucination_rate, 4),
             "answer_completeness": round(result.answer_completeness, 4),
             "instruction_following_rate": round(result.instruction_following_rate, 4),
             "actionability_score": round(result.actionability_score, 4),
+            "actionability_applicable": bool(result.actionability_applicable),
             "generation_quality_score": round(result.generation_quality_score, 4),
             "latency": round(result.latency, 4),
             "status": str(result.failure_path.get("status", "unknown")),
@@ -1009,34 +1134,42 @@ class EvalChecker:
 
     def _load_indexed_sources(self) -> List[str]:
         sources: List[str] = []
-        with sqlite3.connect(f"file:{self.config.database.db_path}?mode=ro", uri=True) as conn:
-            conn.row_factory = sqlite3.Row
-            tables = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
-                )
-            }
-            if "chunks" in tables:
-                sources.extend(
-                    [
-                        str(row["source_filename"]).strip()
-                        for row in conn.execute(
-                            "SELECT DISTINCT source_filename FROM chunks WHERE source_filename IS NOT NULL"
-                        ).fetchall()
-                        if str(row["source_filename"]).strip()
-                    ]
-                )
-            if "files" in tables:
-                sources.extend(
-                    [
-                        str(row["filename"]).strip()
-                        for row in conn.execute(
-                            "SELECT DISTINCT filename FROM files WHERE filename IS NOT NULL"
-                        ).fetchall()
-                        if str(row["filename"]).strip()
-                    ]
-                )
+        try:
+            with sqlite3.connect(f"file:{self.config.database.db_path}?mode=ro", uri=True) as conn:
+                conn.row_factory = sqlite3.Row
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+                    )
+                }
+                if "chunks" in tables:
+                    sources.extend(
+                        [
+                            str(row["source_filename"]).strip()
+                            for row in conn.execute(
+                                "SELECT DISTINCT source_filename FROM chunks WHERE source_filename IS NOT NULL"
+                            ).fetchall()
+                            if str(row["source_filename"]).strip()
+                        ]
+                    )
+                if "files" in tables:
+                    sources.extend(
+                        [
+                            str(row["filename"]).strip()
+                            for row in conn.execute(
+                                "SELECT DISTINCT filename FROM files WHERE filename IS NOT NULL"
+                            ).fetchall()
+                            if str(row["filename"]).strip()
+                        ]
+                    )
+        except sqlite3.Error as exc:
+            logger.warning(
+                "Failed to open indexed source DB '%s': %s. Continue with empty source inventory.",
+                self.config.database.db_path,
+                exc,
+            )
+            return []
         deduped: List[str] = []
         seen: set[str] = set()
         for source in sources:
@@ -1313,6 +1446,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    _configure_utf8_stdio()
     parser = build_parser()
     args = parser.parse_args()
 
@@ -1370,3 +1504,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

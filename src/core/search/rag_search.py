@@ -25,7 +25,7 @@ class SearchResult:
     section_title: str = ""
 
 
-class RAGSearcher:
+class LegacyRAGSearcher:
     def __init__(
         self,
         db_path: str,
@@ -358,3 +358,7 @@ class RAGSearcher:
             "hard_filtered_candidates": list(hard_filtered or []),
             "conflict_pool_candidates": list(conflict_pool or []),
         }
+
+
+# Backward-compatible alias.
+RAGSearcher = LegacyRAGSearcher

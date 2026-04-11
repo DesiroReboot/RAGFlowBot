@@ -79,6 +79,11 @@ class QueryAnalyzerProtocol(Protocol):
         local_results: list[Any],
         search_trace: dict[str, Any] | None = None,
     ) -> QueryAnalysis:
+        ... 
+
+
+class RAGSearcherProtocol(Protocol):
+    def search_with_trace(self, query: str) -> tuple[list[Any], dict[str, Any]]:
         ...
 
 
@@ -115,7 +120,7 @@ class SearchOrchestrator:
         self,
         *,
         planner: Planner,
-        rag_searcher: Any,
+        rag_searcher: RAGSearcherProtocol,
         web_searcher: WebSearcher | None,
         config: Any,
         query_analyzer: QueryAnalyzerProtocol | None = None,

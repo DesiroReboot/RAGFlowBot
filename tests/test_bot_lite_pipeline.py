@@ -10,6 +10,7 @@ from src.core.search.rag_search import SearchResult
 def _make_agent(*, template_enabled: bool, orchestrator: object) -> ReActAgent:
     agent = ReActAgent.__new__(ReActAgent)
     agent.answer_top_k = 3
+    agent.retrieval_provider = "legacy"
     agent.search_orchestrator = orchestrator
     agent.config = SimpleNamespace(
         search=SimpleNamespace(l1_template_enabled=template_enabled),
@@ -42,6 +43,7 @@ def test_run_sync_uses_lite_pipeline_template_gate() -> None:
     assert response.trace["strategy_execution"][0]["stage"] == "l1_gate"
     assert response.trace["strategy_execution"][0]["decision"] == "template_response"
     assert response.trace["retrieval_confidence"] == 0.2
+    assert response.trace["retrieval_provider"] == "legacy"
 
 
 def test_run_sync_uses_lite_pipeline_l2_when_triggered() -> None:
@@ -80,3 +82,4 @@ def test_run_sync_uses_lite_pipeline_l2_when_triggered() -> None:
     assert response.retrieval_confidence >= 0.82
     assert response.trace["strategy_execution"][0]["stage"] == "l1_gate"
     assert response.trace["strategy_execution"][0]["decision"] == "trigger_full_rag"
+    assert response.trace["retrieval_provider"] == "legacy"

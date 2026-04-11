@@ -77,6 +77,13 @@ class FeishuEventService:
     def run_self_check(self) -> dict[str, Any]:
         feishu_cfg = self.config.gateway.feishu
         credential_validation = self.api_client.validate_credentials()
+        retrieval_provider = str(getattr(self.config.search, "rag_provider", "legacy")).strip().lower() or "legacy"
+        ragflow_cfg = getattr(self.config, "ragflow", None)
+        ragflow_ready = bool(
+            str(getattr(ragflow_cfg, "base_url", "")).strip()
+            and str(getattr(ragflow_cfg, "api_key", "")).strip()
+            and bool(getattr(ragflow_cfg, "dataset_map", {}))
+        )
         checks = [
             {
                 "stage": "gateway.enabled",
@@ -112,6 +119,23 @@ class FeishuEventService:
                 "stage": "gateway.tenant_access_token",
                 "ok": bool(credential_validation["ok"]),
                 "detail": credential_validation,
+            },
+            {
+                "stage": "retrieval.provider",
+                "ok": retrieval_provider in {"legacy", "ragflow"},
+                "detail": {"provider": retrieval_provider},
+            },
+            {
+                "stage": "retrieval.ragflow_config",
+                "ok": True if retrieval_provider != "ragflow" else ragflow_ready,
+                "detail": {
+                    "enabled": retrieval_provider == "ragflow",
+                    "base_url_set": bool(str(getattr(ragflow_cfg, "base_url", "")).strip()),
+                    "api_key_set": bool(str(getattr(ragflow_cfg, "api_key", "")).strip()),
+                    "dataset_count": len(dict(getattr(ragflow_cfg, "dataset_map", {}) or {})),
+                    "timeout_ms": int(getattr(ragflow_cfg, "timeout_ms", 0) or 0),
+                    "fallback_to_legacy": bool(getattr(ragflow_cfg, "fallback_to_legacy", True)),
+                },
             },
         ]
         ok_count = sum(1 for item in checks if item["ok"])

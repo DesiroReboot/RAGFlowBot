@@ -12,7 +12,9 @@ from src.core.search.lite_gate import LOW_RELEVANCE_REASON_CODE, build_template_
 from src.core.search.orchestrator import SearchOrchestrator, UnifiedSearchHit
 from src.core.search.planner import RulePlanner
 from src.core.search.query_analyzer import QueryAnalysis, QueryAnalyzer
-from src.core.search.rag_search import RAGSearcher, SearchResult
+from src.core.search.rag_search import LegacyRAGSearcher, RAGSearcher, SearchResult
+from src.core.search.ragflow_client import RAGFlowClient
+from src.core.search.ragflow_searcher import RAGFlowSearcher
 from src.core.search.source_utils import build_grouped_citations
 from src.core.search.web_result_evaluator import WebResultEvaluator
 from src.core.search.web_router import WebRouter
@@ -92,7 +94,8 @@ class ReActAgent:
             build_version=config.knowledge_base.build_version,
         )
         self.manifest_store = ManifestStore(config.database.db_path, ensure_schema=False)
-        self.rag_searcher = RAGSearcher(
+        self.rag_provider = self._resolve_rag_provider()
+        self.legacy_rag_searcher = LegacyRAGSearcher(
             db_path=config.database.db_path,
             top_k=self.answer_top_k,
             fts_top_k=config.search.fts_top_k,
@@ -112,6 +115,8 @@ class ReActAgent:
             qa_anchor_enabled=config.search.qa_anchor_enabled,
             semantic_guard_enabled=config.search.semantic_guard_enabled,
         )
+        self.rag_searcher = self._build_rag_searcher()
+        self.retrieval_provider = "ragflow" if self.rag_provider == "ragflow" else "legacy"
         self.planner = RulePlanner()
         self.query_analyzer = QueryAnalyzer()
         self.web_search_client = WebSearchClient(
@@ -140,22 +145,51 @@ class ReActAgent:
         # Backward-compatible alias for any legacy direct access.
         self.searcher = self.rag_searcher
 
+    def _resolve_rag_provider(self) -> str:
+        raw = str(getattr(getattr(self.config, "search", None), "rag_provider", "legacy")).strip().lower()
+        return raw if raw in {"legacy", "ragflow"} else "legacy"
+
+    def _build_rag_searcher(self) -> RAGSearcher | RAGFlowSearcher:
+        if self.rag_provider != "ragflow":
+            return self.legacy_rag_searcher
+
+        ragflow_cfg = getattr(self.config, "ragflow", None)
+        client = RAGFlowClient(
+            base_url=str(getattr(ragflow_cfg, "base_url", "")).strip(),
+            api_key=str(getattr(ragflow_cfg, "api_key", "")).strip(),
+            timeout_ms=int(getattr(ragflow_cfg, "timeout_ms", 2500)),
+            max_retries=1,
+        )
+        return RAGFlowSearcher(
+            client=client,
+            dataset_map=dict(getattr(ragflow_cfg, "dataset_map", {}) or {}),
+            top_k=max(1, int(getattr(ragflow_cfg, "top_k", self.answer_top_k))),
+            min_score=float(getattr(ragflow_cfg, "min_score", 0.0)),
+            fallback_to_legacy=bool(getattr(ragflow_cfg, "fallback_to_legacy", True)),
+            legacy_searcher=self.legacy_rag_searcher,
+        )
+
     def run_sync(self, query: str, include_trace: bool = False) -> AgentResponse:
         try:
             self.answer_top_k = max(1, int(getattr(self, "answer_top_k", 3)))
         except Exception:
             self.answer_top_k = 3
+        provider = str(getattr(self, "retrieval_provider", "legacy")).strip().lower() or "legacy"
 
         manifest_gate = self._manifest_gate_snapshot()
         manifest = manifest_gate.get("manifest", {})
         if bool(manifest_gate.get("blocked", False)):
-            search_trace: dict[str, Any] = {"manifest_gate": dict(manifest_gate)}
+            search_trace: dict[str, Any] = {
+                "manifest_gate": dict(manifest_gate),
+                "retrieval_provider": provider,
+            }
             self._normalize_web_trace(search_trace)
             blocked_trace = build_agent_trace(
                 query=query,
                 search_trace=search_trace,
                 manifest=manifest or {},
             )
+            blocked_trace["retrieval_provider"] = provider
             blocked_trace["strategy_execution"] = [
                 build_strategy_fallback_step(reason=TraceFallbackReason.INDEX_NOT_READY)
             ]
@@ -202,6 +236,7 @@ class ReActAgent:
         if not isinstance(search_trace, dict):
             search_trace = {}
         search_trace["manifest_gate"] = dict(manifest_gate)
+        search_trace["retrieval_provider"] = provider
 
         if not (hasattr(self, "search_orchestrator") and self.search_orchestrator is not None):
             # Legacy execution path kept for compatibility when orchestrator is not injected.
@@ -269,6 +304,7 @@ class ReActAgent:
 
         self._normalize_web_trace(search_trace)
         trace = build_agent_trace(query=query, search_trace=search_trace, manifest=manifest or {})
+        trace["retrieval_provider"] = provider
 
         if not results:
             planner_trace = search_trace.get("planner", {}) if isinstance(search_trace, dict) else {}
@@ -350,6 +386,7 @@ class ReActAgent:
         include_trace: bool = False,
         manifest_gate: dict[str, Any] | None = None,
     ) -> AgentResponse | None:
+        provider = str(getattr(self, "retrieval_provider", "legacy")).strip().lower() or "legacy"
         orchestrator = getattr(self, "search_orchestrator", None)
         required_methods = ("run_l1_partial", "route_by_l1_confidence", "run_l2_full")
         if orchestrator is None or not all(hasattr(orchestrator, name) for name in required_methods):
@@ -383,6 +420,7 @@ class ReActAgent:
             if isinstance(raw_l1_trace, dict):
                 search_trace = dict(raw_l1_trace)
             search_trace["manifest_gate"] = manifest_gate_payload
+            search_trace["retrieval_provider"] = provider
             search_trace["decision"] = {
                 "l1_confidence": l1_confidence,
                 "threshold": threshold,
@@ -401,6 +439,7 @@ class ReActAgent:
             )
             self._normalize_web_trace(search_trace)
             trace = build_agent_trace(query=query, search_trace=search_trace, manifest=manifest or {})
+            trace["retrieval_provider"] = provider
             trace["strategy_execution"].append(
                 {
                     "stage": "l1_gate",
@@ -430,9 +469,11 @@ class ReActAgent:
         if not isinstance(search_trace, dict):
             search_trace = {}
         search_trace["manifest_gate"] = manifest_gate_payload
+        search_trace["retrieval_provider"] = provider
         self._normalize_web_trace(search_trace)
 
         trace = build_agent_trace(query=query, search_trace=search_trace, manifest=manifest or {})
+        trace["retrieval_provider"] = provider
         trace["strategy_execution"].append(
             {
                 "stage": "l1_gate",
@@ -508,6 +549,15 @@ class ReActAgent:
         )
 
     def _manifest_gate_snapshot(self) -> dict[str, Any]:
+        if str(getattr(self, "rag_provider", "legacy")).strip().lower() == "ragflow":
+            return {
+                "ready": True,
+                "blocked": False,
+                "status": "ragflow_bypass",
+                "reason": "rag_provider_ragflow",
+                "manifest": {},
+            }
+
         manifest_store = getattr(self, "manifest_store", None)
         if manifest_store is None or not hasattr(manifest_store, "get_manifest"):
             return {
