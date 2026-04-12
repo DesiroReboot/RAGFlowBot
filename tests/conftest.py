@@ -8,11 +8,15 @@ import tempfile
 import time
 from uuid import uuid4
 
+from scripts.cleanup_oneoff_artifacts import cleanup_oneoff_artifacts
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("ECBOT_DOTENV_PATH", str(PROJECT_ROOT / ".env.test"))
 LOCAL_TMP = PROJECT_ROOT / "DB" / "tmp_runtime"
 LOCAL_TMP.mkdir(parents=True, exist_ok=True)
+PYTEST_BASETMP_PARENT = PROJECT_ROOT / "tmp_runtime"
+PYTEST_BASETMP_PARENT.mkdir(parents=True, exist_ok=True)
 
 for key in ("TMPDIR", "TMP", "TEMP"):
     os.environ[key] = str(LOCAL_TMP)
@@ -78,3 +82,15 @@ def _safe_rmtree(path: str, *args, **kwargs) -> None:
 
 
 shutil.rmtree = _safe_rmtree
+
+
+def _cleanup_ragv2_oneoff_artifacts() -> None:
+    cleanup_oneoff_artifacts(PROJECT_ROOT, dry_run=False)
+
+
+def pytest_sessionstart(session) -> None:  # type: ignore[no-untyped-def]
+    _cleanup_ragv2_oneoff_artifacts()
+
+
+def pytest_sessionfinish(session, exitstatus) -> None:  # type: ignore[no-untyped-def]
+    _cleanup_ragv2_oneoff_artifacts()
