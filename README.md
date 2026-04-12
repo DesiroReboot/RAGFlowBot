@@ -29,7 +29,7 @@ RAGFlowBot 是一个面向飞书的问答机器人，当前网关已重构为 **
 ## 配置示例
 
 配置文件默认读取 `config/config.json`（若不存在会回退到 `config.json`）。
-程序启动时会优先加载私有 `E:\\DATA\\ECBot\\.env`（可用 `ECBOT_DOTENV_PATH` 指定其他路径），再用项目内 `.env.example` 补齐缺失变量。
+程序启动时仅加载项目内 `.env`，然后用 `.env.example` 补齐缺失变量。
 
 ```json
 {
@@ -52,7 +52,7 @@ RAGFlowBot 是一个面向飞书的问答机器人，当前网关已重构为 **
 说明：
 - `receive_mode=webhook` 时使用 HTTP 回调。
 - `receive_mode=long_connection` 时使用飞书 SDK 长连接，不需要配置订阅 URL。
-- 配置优先级：系统环境变量 > 私有 `E:\\DATA\\ECBot\\.env`（或 `ECBOT_DOTENV_PATH`）> `.env.example` > `config/config.json`。
+- 配置解析规则：`config/config.json` 优先；当配置值为空、占位符（如 `YOUR_*`）或缺失时，才会回退到环境变量（私有 `E:\\DATA\\ECBot\\.env` / 项目 `.env` / `.env.example`）。
 
 ## .env 配置（推荐）
 
@@ -60,7 +60,7 @@ RAGFlowBot 是一个面向飞书的问答机器人，当前网关已重构为 **
 copy .env.example .env
 ```
 
-把真实密钥写入 `.env`，并保持 `config/config.json` 使用占位符。
+把真实密钥写入 `.env`，并保持 `config/config.json` 使用占位符（如 `YOUR_*`），运行时会自动从 `.env` 回退补全。
 
 模型配置可使用共享变量避免重复修改：
 

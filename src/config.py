@@ -60,8 +60,54 @@ def _as_str_dict(value: Any, default: dict[str, str]) -> dict[str, str]:
     return merged
 
 
+def _is_invalid_config_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return True
+        return _is_placeholder_env_value(text)
+    return False
+
+
 def _env(name: str, default: Any) -> Any:
-    return os.getenv(name, default)
+    if not _is_invalid_config_value(default):
+        return default
+    raw = os.getenv(name)
+    if raw is not None:
+        return raw
+    return default
+
+
+def _resolve_env_first(name: str, config_value: Any, default: Any) -> Any:
+    raw = os.getenv(name)
+    if raw is not None:
+        return raw
+    if config_value is not None:
+        return config_value
+    return default
+
+
+def _resolve_config_first(name: str, config_value: Any, default: Any) -> Any:
+    if not _is_invalid_config_value(config_value):
+        return config_value
+    raw = os.getenv(name)
+    if raw is not None:
+        return raw
+    return default
+
+
+def _resolve_by_authority(
+    *,
+    name: str,
+    config_value: Any,
+    default: Any,
+    authority: str,
+    prefer: str,
+) -> Any:
+    del authority, prefer
+    return _resolve_config_first(name, config_value, default)
 
 
 def _strip_wrapped_quotes(value: str) -> str:
@@ -75,10 +121,10 @@ def _is_placeholder_env_value(value: str) -> bool:
     return bool(normalized) and normalized.startswith("YOUR_")
 
 
-def _load_dotenv_file(path: str = ".env", *, ignore_placeholders: bool = False) -> None:
+def _load_dotenv_file(path: str = ".env", *, ignore_placeholders: bool = False) -> bool:
     dotenv_path = Path(path)
     if not dotenv_path.exists() or not dotenv_path.is_file():
-        return
+        return False
 
     for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.lstrip("\ufeff").strip()
@@ -96,20 +142,17 @@ def _load_dotenv_file(path: str = ".env", *, ignore_placeholders: bool = False) 
         if ignore_placeholders and _is_placeholder_env_value(value):
             continue
         os.environ.setdefault(key, value)
-
-
-def _resolve_default_private_dotenv() -> str:
-    # Prefer sibling repo path like E:\DATA\ECBot\.env when running in E:\DATA\ECBot-memory/web-search.
-    sibling_private = Path.cwd().resolve().parent / "ECBot" / ".env"
-    if sibling_private.exists() and sibling_private.is_file():
-        return str(sibling_private)
-    return ".env"
+    return True
 
 
 def _load_env_layers() -> None:
-    private_dotenv = os.getenv("ECBOT_DOTENV_PATH", _resolve_default_private_dotenv())
-    # Private first so it has higher precedence; public template only backfills missing keys.
-    _load_dotenv_file(private_dotenv)
+    # Load order (high -> low priority) with setdefault semantics:
+    # 1) project-local .env
+    # 2) .env.example as a non-secret fallback template
+    #
+    # This intentionally avoids reading dotenv paths from external environment pointers
+    # such as ECBOT_DOTENV_PATH, so runtime config only comes from the current project.
+    _load_dotenv_file(".env")
     _load_dotenv_file(".env.example", ignore_placeholders=True)
 
 
@@ -288,6 +331,7 @@ class Config:
         generation_data = data.get("generation", {})
         knowledge_base_data = data.get("knowledge_base", {})
         gateway_data = data.get("gateway", {}).get("feishu", {})
+        config_authority = str(os.getenv("ECBOT_CONFIG_AUTHORITY", "config")).strip().lower() or "config"
         output_guardrail_data = data.get("guardrails", {}).get("output", {})
         evaluation_data = data.get("evaluation", {})
         web_threshold_defaults = {
@@ -360,46 +404,59 @@ class Config:
                 ),
             )
         )
+        kb_auto_config_value = knowledge_base_data.get(
+            "auto_init_on_startup",
+            knowledge_base_data.get("auto_sync_on_startup"),
+        )
         kb_auto_startup = _as_bool(
-            _env(
-                "ECBOT_KB_AUTO_INIT_ON_STARTUP",
-                _env(
-                    "ECBOT_KB_AUTO_SYNC",
-                    knowledge_base_data.get(
-                        "auto_init_on_startup",
-                        knowledge_base_data.get("auto_sync_on_startup", False),
-                    ),
-                ),
+            _resolve_by_authority(
+                name="ECBOT_KB_AUTO_INIT_ON_STARTUP",
+                config_value=kb_auto_config_value,
+                default=_env("ECBOT_KB_AUTO_SYNC", False),
+                authority=config_authority,
+                prefer="config",
             ),
             False,
         )
         kb_init_blocking = _as_bool(
-            _env(
-                "ECBOT_KB_INIT_BLOCKING",
-                knowledge_base_data.get("init_blocking", False),
+            _resolve_by_authority(
+                name="ECBOT_KB_INIT_BLOCKING",
+                config_value=knowledge_base_data.get("init_blocking"),
+                default=False,
+                authority=config_authority,
+                prefer="config",
             ),
             False,
         )
         kb_init_fail_open = _as_bool(
-            _env(
-                "ECBOT_KB_INIT_FAIL_OPEN",
-                knowledge_base_data.get("init_fail_open", True),
+            _resolve_by_authority(
+                name="ECBOT_KB_INIT_FAIL_OPEN",
+                config_value=knowledge_base_data.get("init_fail_open"),
+                default=True,
+                authority=config_authority,
+                prefer="config",
             ),
             True,
         )
-        shared_model_name = str(_env("ECBOT_MODEL", "")).strip()
+        shared_model_name = str(os.getenv("ECBOT_MODEL", "")).strip()
         embedding_model_default = str(embedding_data.get("model", "text-embedding-v4")).strip()
         generation_model_default = str(generation_data.get("model", "qwen-plus")).strip()
         resolved_embedding_model = str(
-            _env(
-                "ECBOT_EMBEDDING_MODEL",
-                shared_model_name or embedding_model_default,
+            _resolve_by_authority(
+                name="ECBOT_EMBEDDING_MODEL",
+                config_value=embedding_data.get("model"),
+                default=shared_model_name or embedding_model_default,
+                authority=config_authority,
+                prefer="config",
             )
         ).strip()
         resolved_generation_model = str(
-            _env(
-                "ECBOT_GENERATION_MODEL",
-                shared_model_name or generation_model_default,
+            _resolve_by_authority(
+                name="ECBOT_GENERATION_MODEL",
+                config_value=generation_data.get("model"),
+                default=shared_model_name or generation_model_default,
+                authority=config_authority,
+                prefer="config",
             )
         ).strip()
 
@@ -671,7 +728,16 @@ class Config:
         )
         self.gateway = GatewayConfig(
             feishu=GatewayFeishuConfig(
-                enabled=_as_bool(gateway_data.get("enabled"), False),
+                enabled=_as_bool(
+                    _resolve_by_authority(
+                        name="ECBOT_FEISHU_ENABLED",
+                        config_value=gateway_data.get("enabled"),
+                        default=False,
+                        authority=config_authority,
+                        prefer="config",
+                    ),
+                    False,
+                ),
                 openapi_base_url=str(
                     _env(
                         "ECBOT_FEISHU_OPENAPI_BASE_URL",
@@ -681,11 +747,16 @@ class Config:
                 app_id=str(_env("ECBOT_FEISHU_APP_ID", gateway_data.get("app_id", ""))),
                 app_secret=str(_env("ECBOT_FEISHU_APP_SECRET", gateway_data.get("app_secret", ""))),
                 receive_mode=str(
-                    _env(
-                        "ECBOT_FEISHU_RECEIVE_MODE",
-                        gateway_data.get("receive_mode", "long_connection"),
+                    _resolve_by_authority(
+                        name="ECBOT_FEISHU_RECEIVE_MODE",
+                        config_value=gateway_data.get("receive_mode"),
+                        default="long_connection",
+                        authority=config_authority,
+                        prefer="config",
                     )
-                ).strip().lower(),
+                )
+                .strip()
+                .lower(),
                 long_conn_log_level=str(
                     _env(
                         "ECBOT_FEISHU_LONG_CONN_LOG_LEVEL",
@@ -703,9 +774,33 @@ class Config:
                 target_chat_id=str(
                     _env("ECBOT_FEISHU_TARGET_CHAT_ID", gateway_data.get("target_chat_id", ""))
                 ),
-                webhook_host=str(_env("ECBOT_FEISHU_WEBHOOK_HOST", gateway_data.get("webhook_host", "127.0.0.1"))),
-                webhook_port=int(gateway_data.get("webhook_port", 8000)),
-                webhook_path=str(gateway_data.get("webhook_path", "/webhook/feishu")),
+                webhook_host=str(
+                    _resolve_by_authority(
+                        name="ECBOT_FEISHU_WEBHOOK_HOST",
+                        config_value=gateway_data.get("webhook_host"),
+                        default="127.0.0.1",
+                        authority=config_authority,
+                        prefer="config",
+                    )
+                ),
+                webhook_port=int(
+                    _resolve_by_authority(
+                        name="ECBOT_FEISHU_WEBHOOK_PORT",
+                        config_value=gateway_data.get("webhook_port"),
+                        default=8000,
+                        authority=config_authority,
+                        prefer="config",
+                    )
+                ),
+                webhook_path=str(
+                    _resolve_by_authority(
+                        name="ECBOT_FEISHU_WEBHOOK_PATH",
+                        config_value=gateway_data.get("webhook_path"),
+                        default="/webhook/feishu",
+                        authority=config_authority,
+                        prefer="config",
+                    )
+                ),
                 request_timeout=int(gateway_data.get("request_timeout", 30)),
             )
         )

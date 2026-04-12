@@ -49,6 +49,7 @@ class ContextSelector:
             key=lambda row: float(row.get("score", 0.0)),
             reverse=True,
         )
+        selected: list[dict[str, Any]]
         if self.source_quota_mode == "unbounded":
             selected = self._select_unbounded(
                 ranked_candidates=ranked_candidates,
@@ -60,7 +61,7 @@ class ContextSelector:
             return selected, citations
 
         per_source_count: dict[str, int] = {}
-        selected: list[dict[str, Any]] = []
+        selected = []
         for candidate in ranked_candidates:
             source = str(candidate.get("source", ""))
             if source not in quotas:

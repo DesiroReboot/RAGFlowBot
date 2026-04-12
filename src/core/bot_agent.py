@@ -30,6 +30,8 @@ from src.core.trace_builder import (
 )
 from src.RAG.config.kbase_config import KBaseConfig
 from src.RAG.readiness import is_index_ready
+from src.RAG.storage.sqlite_conn import connect
+from src.RAG.storage.sqlite_schema import ensure_schema
 from src.RAG.storage.manifest_store import ManifestStore
 
 
@@ -169,7 +171,14 @@ class ReActAgent:
             legacy_searcher=self.legacy_rag_searcher,
         )
 
-    def run_sync(self, query: str, include_trace: bool = False) -> AgentResponse:
+    def run_sync(
+        self,
+        query: str,
+        include_trace: bool = False,
+        *,
+        run_id: str | None = None,
+        memory_store: Any | None = None,
+    ) -> AgentResponse:
         try:
             self.answer_top_k = max(1, int(getattr(self, "answer_top_k", 3)))
         except Exception:
@@ -219,7 +228,15 @@ class ReActAgent:
         if hasattr(self, "search_orchestrator") and self.search_orchestrator is not None:
             if hasattr(self.search_orchestrator, "answer_top_k"):
                 self.search_orchestrator.answer_top_k = self.answer_top_k
-            orchestrator_result = self.search_orchestrator.search_with_trace(query)
+            try:
+                orchestrator_result = self.search_orchestrator.search_with_trace(
+                    query,
+                    run_id=run_id,
+                    memory_store=memory_store,
+                )
+            except TypeError:
+                # Compatibility for tests/mocks implementing the legacy signature.
+                orchestrator_result = self.search_orchestrator.search_with_trace(query)
             results = self._coerce_search_hits(orchestrator_result.hits)
             search_trace = (
                 orchestrator_result.trace_search if isinstance(orchestrator_result.trace_search, dict) else {}
@@ -580,7 +597,7 @@ class ReActAgent:
             }
 
         manifest = raw_manifest if isinstance(raw_manifest, dict) else {}
-        ready, reason, status = is_index_ready(manifest)
+        ready, reason, status = is_index_ready(manifest, self._index_counts_snapshot())
         return {
             "ready": bool(ready),
             "blocked": not bool(ready),
@@ -588,6 +605,31 @@ class ReActAgent:
             "reason": reason,
             "manifest": manifest,
         }
+
+    def _index_counts_snapshot(self) -> dict[str, int]:
+        counts = {
+            "indexed_files": 0,
+            "indexed_chunks": 0,
+            "fts_documents": 0,
+            "vec_rows": 0,
+        }
+        try:
+            with connect(self.config.database.db_path) as conn:
+                ensure_schema(conn)
+                counts["indexed_files"] = self._safe_count(conn, "files")
+                counts["indexed_chunks"] = self._safe_count(conn, "chunks")
+                counts["fts_documents"] = self._safe_count(conn, "fts_index")
+                counts["vec_rows"] = self._safe_count(conn, "vec_index")
+        except Exception:
+            return counts
+        return counts
+
+    @staticmethod
+    def _safe_count(conn: Any, table_name: str) -> int:
+        try:
+            return int(conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0])
+        except Exception:
+            return 0
 
     def _apply_web_routing(
         self,
@@ -1517,10 +1559,18 @@ class ReActAgent:
     @staticmethod
     def _infer_section_locator(item: Any) -> str:
         chunk_id = getattr(item, "chunk_id", None)
-        try:
+        chunk_num = -1
+        if isinstance(chunk_id, int):
+            chunk_num = chunk_id
+        elif isinstance(chunk_id, float):
             chunk_num = int(chunk_id)
-        except Exception:
-            chunk_num = -1
+        elif isinstance(chunk_id, str):
+            stripped = chunk_id.strip()
+            if stripped:
+                try:
+                    chunk_num = int(stripped)
+                except ValueError:
+                    chunk_num = -1
         if chunk_num >= 0:
             return f"chunk#{chunk_num}"
 

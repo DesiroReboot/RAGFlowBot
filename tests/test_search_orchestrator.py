@@ -208,6 +208,20 @@ class _StubWebClient:
         ]
 
 
+class _MemoryStoreRecorder:
+    def __init__(self) -> None:
+        self.decision_rows: list[dict[str, Any]] = []
+        self.io_rows: list[dict[str, Any]] = []
+
+    def safe_call(self, fn_name: str, **kwargs: Any) -> None:
+        if fn_name == "append_decision_trace":
+            self.decision_rows.append(dict(kwargs))
+            return
+        if fn_name == "append_io_snapshot":
+            self.io_rows.append(dict(kwargs))
+            return
+
+
 def test_orchestrator_uses_planner_fields_and_skips_web_execution() -> None:
     rag_searcher = _StubRAGSearcher()
     planner = _StubPlanner(
@@ -405,3 +419,53 @@ def test_orchestrator_accepts_ragflow_searcher_contract() -> None:
     assert rag_searcher.called == 1
     assert len(result.hits) == 1
     assert result.hits[0].source == "ragflow-doc"
+
+
+def test_orchestrator_writes_memory_decision_and_retrieved_snapshots() -> None:
+    rag_searcher = _StubRAGSearcher()
+    planner = _StubPlanner(
+        output=PlannerOutput(
+            plan_id="plan-memory",
+            need_web_search=True,
+            source_route="hybrid",
+            fusion_strategy="none",
+            domain_relevance_score=0.83,
+            reasons=["temporal_intent_high"],
+            retrieval_plan={"sources": [{"name": "kb_index", "enabled": True}]},
+        )
+    )
+    web_client = _StubWebClient()
+    recorder = _MemoryStoreRecorder()
+    orchestrator = SearchOrchestrator(
+        planner=planner,
+        rag_searcher=rag_searcher,
+        web_searcher=web_client,
+        config=SimpleNamespace(
+            search=SimpleNamespace(
+                web_search_enabled=True,
+                web_rag_max_docs=8,
+                web_search_provider="tavily",
+                phase_a_rag_confidence_threshold=0.2,
+                l1_trigger_threshold=0.2,
+                l2_max_top_k=4,
+            )
+        ),
+        query_analyzer=_StubAnalyzer(),
+        web_result_evaluator=_StubWebEvaluator(),
+        web_router=_StubWebRouter(),
+        answer_top_k=3,
+    )
+
+    result = orchestrator.search_with_trace(
+        "latest policy update",
+        run_id="run_test_memory_001",
+        memory_store=recorder,
+    )
+
+    assert len(result.hits) >= 1
+    assert len(recorder.decision_rows) >= 4
+    assert any(row.get("stage") == "_apply_web_routing" for row in recorder.decision_rows)
+    assert any(
+        row.get("io_type") == "retrieved_results" and row.get("run_id") == "run_test_memory_001"
+        for row in recorder.io_rows
+    )

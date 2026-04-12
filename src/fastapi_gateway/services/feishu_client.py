@@ -32,10 +32,11 @@ class FeishuAPIClient:
 
     def token_dialog_payload(self) -> dict[str, Any]:
         missing = self.required_tokens()
+        message = "ok" if not missing else "missing Feishu app credentials"
         return {
             "ok": not missing,
             "missing_tokens": missing,
-            "message": "missing Feishu app credentials",
+            "message": message,
         }
 
     def openapi_base_url_ok(self) -> bool:

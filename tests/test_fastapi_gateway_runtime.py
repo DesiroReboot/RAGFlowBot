@@ -22,7 +22,8 @@ def _build_config(tmp_path: Path, *, receive_mode: str | None = None) -> Config:
     return Config(str(path))
 
 
-def test_resolve_receive_mode_default_long_connection(tmp_path: Path) -> None:
+def test_resolve_receive_mode_default_long_connection(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("ECBOT_DOTENV_PATH", ".env.not-found")
     cfg = _build_config(tmp_path)
     assert runtime.resolve_receive_mode(cfg) == "long_connection"
 

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 import math
 import re
-from typing import Any, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from src.core.search.lite_gate import (
     LOW_RELEVANCE_REASON_CODE,
@@ -115,6 +115,14 @@ class WebRouterProtocol(Protocol):
         ...
 
 
+class QAMemoryStoreProtocol(Protocol):
+    def safe_call(self, fn_name: str, **kwargs: Any) -> None:
+        ...
+
+
+DecisionWriter = Callable[[str, str, bool, dict[str, Any], dict[str, Any]], None]
+
+
 class SearchOrchestrator:
     def __init__(
         self,
@@ -137,9 +145,68 @@ class SearchOrchestrator:
         self.web_router = web_router
         self.answer_top_k = max(1, int(answer_top_k))
 
-    def search_with_trace(self, query: str) -> OrchestratorResult:
+    def search_with_trace(
+        self,
+        query: str,
+        *,
+        run_id: str | None = None,
+        memory_store: QAMemoryStoreProtocol | None = None,
+    ) -> OrchestratorResult:
+        decision_seq = 0
+
+        def write_decision(
+            stage: str,
+            decision_code: str,
+            fallback_used: bool,
+            metrics: dict[str, Any] | None = None,
+            payload: dict[str, Any] | None = None,
+        ) -> None:
+            nonlocal decision_seq
+            if not run_id or memory_store is None:
+                return
+            decision_seq += 1
+            memory_store.safe_call(
+                "append_decision_trace",
+                run_id=run_id,
+                seq_no=decision_seq,
+                stage=stage,
+                decision_code=decision_code,
+                decision_summary=decision_code,
+                fallback_used=fallback_used,
+                metrics=metrics or {},
+                payload=payload or {},
+            )
+
         l1_result = self.run_l1_partial(query)
+        l1_trace = dict(l1_result.trace.get("l1", {})) if isinstance(l1_result.trace, dict) else {}
+        write_decision(
+            "run_l1_partial",
+            "L1_PARTIAL_READY",
+            False,
+            {
+                "l1_confidence": float(l1_result.confidence),
+                "hit_count": int(l1_trace.get("hit_count", len(l1_result.hits))),
+                "threshold": float(l1_trace.get("threshold", self._l1_trigger_threshold())),
+            },
+            {
+                "reason_codes": list(l1_trace.get("reason_codes", [])),
+                "analysis": dict(l1_result.trace.get("analysis", {}))
+                if isinstance(l1_result.trace, dict)
+                else {},
+            },
+        )
         decision = self.route_by_l1_confidence(l1_result)
+        write_decision(
+            "route_by_l1_confidence",
+            decision.reason_code,
+            not bool(decision.trigger_full_rag),
+            {
+                "l1_confidence": float(decision.l1_confidence),
+                "threshold": float(decision.threshold),
+                "trigger_full_rag": bool(decision.trigger_full_rag),
+            },
+            {},
+        )
         decision_trace = build_gate_decision_trace(
             l1_confidence=l1_result.confidence,
             threshold=decision.threshold,
@@ -148,9 +215,14 @@ class SearchOrchestrator:
         )
 
         if decision.trigger_full_rag:
-            l2_result = self.run_l2_full(query, l1_result)
+            l2_result = self.run_l2_full(query, l1_result, decision_writer=write_decision)
             trace_search = dict(l2_result.trace or {})
             trace_search["decision"] = decision_trace
+            self._write_retrieved_results_snapshot(
+                run_id=run_id,
+                memory_store=memory_store,
+                hits=l2_result.hits,
+            )
             return OrchestratorResult(
                 hits=l2_result.hits,
                 citations=l2_result.citations,
@@ -191,6 +263,21 @@ class SearchOrchestrator:
         trace_search["l1"] = dict(l1_result.trace.get("l1", {})) if isinstance(l1_result.trace, dict) else {}
         trace_search["l2"] = l2_trace
         trace_search["decision"] = decision_trace
+        write_decision(
+            "search_with_trace",
+            "L1_GATE_BLOCKED",
+            True,
+            {
+                "retrieval_confidence": retrieval_confidence,
+                "selected_hit_count": len(l1_hits),
+            },
+            {"reason_code": decision.reason_code},
+        )
+        self._write_retrieved_results_snapshot(
+            run_id=run_id,
+            memory_store=memory_store,
+            hits=l1_hits,
+        )
         return OrchestratorResult(
             hits=l1_hits,
             citations=citations,
@@ -252,7 +339,13 @@ class SearchOrchestrator:
             l1_confidence=float(l1_result.confidence),
         )
 
-    def run_l2_full(self, query: str, l1_result: L1Result) -> L2Result:
+    def run_l2_full(
+        self,
+        query: str,
+        l1_result: L1Result,
+        *,
+        decision_writer: DecisionWriter | None = None,
+    ) -> L2Result:
         local_hits = list(l1_result.hits)
         rag_trace = dict(l1_result.trace.get("rag_trace", {})) if isinstance(l1_result.trace, dict) else {}
         query_analysis = self._analyze_query(
@@ -269,12 +362,30 @@ class SearchOrchestrator:
             query,
             trace_context={"query_analysis": query_analysis.to_dict()},
         )
+        if decision_writer is not None:
+            decision_writer(
+                "run_l2_full",
+                "PLANNER_READY",
+                False,
+                {
+                    "need_web_search": bool(planner_output.need_web_search),
+                    "domain_relevance_score": float(planner_output.domain_relevance_score),
+                    "planner_confidence": float(planner_output.confidence),
+                },
+                {
+                    "source_route": str(planner_output.source_route),
+                    "route_mode": str(planner_output.route_mode),
+                    "fusion_strategy": str(planner_output.fusion_strategy),
+                    "reasons": list(planner_output.reasons),
+                },
+            )
 
         merged_hits, web_trace = self._apply_web_routing(
             query=query,
             local_hits=local_hits,
             planner_output=planner_output,
             query_analysis=query_analysis,
+            decision_writer=decision_writer,
         )
 
         l2_max_top_k = self._l2_max_top_k()
@@ -291,6 +402,20 @@ class SearchOrchestrator:
                 "web_fusion_strategy": str(web_trace.get("fusion_strategy", "none")),
             },
         )
+        if decision_writer is not None:
+            decision_writer(
+                "run_l2_full",
+                "L2_RESULTS_SELECTED",
+                bool(web_trace.get("fallback_used", False)),
+                {
+                    "retrieval_confidence": retrieval_confidence,
+                    "selected_hit_count": len(selected_hits),
+                    "web_fusion_strategy": str(web_trace.get("fusion_strategy", "none")),
+                },
+                {
+                    "citations_count": len(citations),
+                },
+            )
         trace_search = self._build_trace(
             query=query,
             planner_output=planner_output,
@@ -346,6 +471,7 @@ class SearchOrchestrator:
         local_hits: list[UnifiedSearchHit],
         planner_output: PlannerOutput,
         query_analysis: QueryAnalysis,
+        decision_writer: DecisionWriter | None = None,
     ) -> tuple[list[UnifiedSearchHit], dict[str, Any]]:
         phase_a_threshold = self._phase_a_rag_confidence_threshold()
         kb_confidence = self._phase_a_kb_confidence(local_hits)
@@ -388,6 +514,14 @@ class SearchOrchestrator:
             web_trace["reasons"] = self._merge_reasons(
                 web_trace["reasons"], [TraceFallbackReason.WEB_ROUTING_UNAVAILABLE.value]
             )
+            if decision_writer is not None:
+                decision_writer(
+                    "_apply_web_routing",
+                    TraceFallbackReason.WEB_ROUTING_UNAVAILABLE.value,
+                    True,
+                    dict(web_trace.get("metrics", {})),
+                    {"reasons": list(web_trace.get("reasons", []))},
+                )
             return local_hits, web_trace
 
         if not bool(getattr(self.config.search, "web_search_enabled", False)):
@@ -396,6 +530,14 @@ class SearchOrchestrator:
             web_trace["reasons"] = self._merge_reasons(
                 web_trace["reasons"], [TraceFallbackReason.WEB_SEARCH_DISABLED.value]
             )
+            if decision_writer is not None:
+                decision_writer(
+                    "_apply_web_routing",
+                    TraceFallbackReason.WEB_SEARCH_DISABLED.value,
+                    True,
+                    dict(web_trace.get("metrics", {})),
+                    {"reasons": list(web_trace.get("reasons", []))},
+                )
             return local_hits, web_trace
 
         if not need_web_search:
@@ -404,6 +546,14 @@ class SearchOrchestrator:
             web_trace["reasons"] = self._merge_reasons(
                 web_trace["reasons"], [TraceFallbackReason.WEB_NOT_REQUIRED.value]
             )
+            if decision_writer is not None:
+                decision_writer(
+                    "_apply_web_routing",
+                    TraceFallbackReason.WEB_NOT_REQUIRED.value,
+                    False,
+                    dict(web_trace.get("metrics", {})),
+                    {"reasons": list(web_trace.get("reasons", []))},
+                )
             return local_hits, web_trace
 
         try:
@@ -420,6 +570,14 @@ class SearchOrchestrator:
             web_trace["fallback_used"] = True
             web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], error_reasons)
             web_trace["error"] = error_text
+            if decision_writer is not None:
+                decision_writer(
+                    "_apply_web_routing",
+                    TraceFallbackReason.WEB_SEARCH_ERROR.value,
+                    True,
+                    dict(web_trace.get("metrics", {})),
+                    {"reasons": list(web_trace.get("reasons", [])), "error": error_text},
+                )
             return local_hits, web_trace
 
         web_trace["metrics"]["provider"] = str(getattr(self.config.search, "web_search_provider", "")).strip()
@@ -429,6 +587,14 @@ class SearchOrchestrator:
             web_trace["reasons"] = self._merge_reasons(
                 web_trace["reasons"], [TraceFallbackReason.WEB_NO_RESULTS.value]
             )
+            if decision_writer is not None:
+                decision_writer(
+                    "_apply_web_routing",
+                    TraceFallbackReason.WEB_NO_RESULTS.value,
+                    True,
+                    dict(web_trace.get("metrics", {})),
+                    {"reasons": list(web_trace.get("reasons", []))},
+                )
             return local_hits, web_trace
 
         evaluator = self.web_result_evaluator
@@ -440,6 +606,14 @@ class SearchOrchestrator:
             web_trace["reasons"] = self._merge_reasons(
                 web_trace["reasons"], [TraceFallbackReason.WEB_ROUTING_UNAVAILABLE.value]
             )
+            if decision_writer is not None:
+                decision_writer(
+                    "_apply_web_routing",
+                    TraceFallbackReason.WEB_ROUTING_UNAVAILABLE.value,
+                    True,
+                    dict(web_trace.get("metrics", {})),
+                    {"reasons": list(web_trace.get("reasons", []))},
+                )
             return local_hits, web_trace
 
         evaluation = evaluator.evaluate(query=query, results=web_results)
@@ -452,6 +626,14 @@ class SearchOrchestrator:
         web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], list(decision.reasons))
         web_trace["metrics"].update(decision.metrics)
         web_trace["fallback_used"] = bool(decision.fallback)
+        if decision_writer is not None:
+            decision_writer(
+                "_apply_web_routing",
+                str(decision.fusion_strategy or "none"),
+                bool(decision.fallback),
+                dict(web_trace.get("metrics", {})),
+                {"reasons": list(web_trace.get("reasons", []))},
+            )
 
         if decision.fusion_strategy == "direct_fusion":
             fused, fusion_detail = self._build_direct_fusion_hits(
@@ -1044,6 +1226,26 @@ class SearchOrchestrator:
         trace["l1"] = dict(l1_trace or {})
         trace["l2"] = dict(l2_trace or {})
         return trace
+
+    def _write_retrieved_results_snapshot(
+        self,
+        *,
+        run_id: str | None,
+        memory_store: QAMemoryStoreProtocol | None,
+        hits: list[UnifiedSearchHit],
+    ) -> None:
+        if not run_id or memory_store is None:
+            return
+        memory_store.safe_call(
+            "append_io_snapshot",
+            run_id=run_id,
+            io_type="retrieved_results",
+            producer="orchestrator",
+            content={
+                "count": len(hits),
+                "hits": [self._hit_to_trace_row(item) for item in hits],
+            },
+        )
 
     def _apply_phase_a_serial_signals(
         self,

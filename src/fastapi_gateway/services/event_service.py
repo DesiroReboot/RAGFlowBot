@@ -9,9 +9,11 @@ import logging
 from threading import Lock
 import time
 from typing import Any
+from uuid import uuid4
 
 from src.config import Config
 from src.core.bot_agent import ReActAgent
+from src.core.memory_store import QAMemoryStore
 from src.core.search.query_preprocessor import QueryPreprocessor
 from src.core.trace_builder import build_debug_trace, extract_first_strategy_reason
 from src.fastapi_gateway.security.verifier import FeishuAuthVerifier
@@ -27,6 +29,12 @@ class GatewayResult:
     fallback_type: str | None = None
     embedding_dialog: dict[str, Any] | None = None
     debug_trace: dict[str, Any] | None = None
+    retrieval_provider: str = "legacy"
+    retrieval_confidence: float = 0.0
+    error_stage: str = ""
+    error_type: str = ""
+    error_message: str = ""
+    agent_trace: dict[str, Any] | None = None
 
 
 EventHandler = Callable[[dict[str, Any]], dict[str, Any]]
@@ -50,6 +58,7 @@ class FeishuEventService:
     def __init__(self, config: Config):
         self.config = config
         self.agent = ReActAgent(config)
+        self.memory_store = QAMemoryStore(config.database.db_path)
         self.api_client = FeishuAPIClient(config.gateway.feishu)
         self.query_preprocessor = QueryPreprocessor()
         self._dedup_ttl_seconds = 120
@@ -77,6 +86,7 @@ class FeishuEventService:
     def run_self_check(self) -> dict[str, Any]:
         feishu_cfg = self.config.gateway.feishu
         credential_validation = self.api_client.validate_credentials()
+        token_dialog = self.api_client.token_dialog_payload()
         retrieval_provider = str(getattr(self.config.search, "rag_provider", "legacy")).strip().lower() or "legacy"
         ragflow_cfg = getattr(self.config, "ragflow", None)
         ragflow_ready = bool(
@@ -102,18 +112,37 @@ class FeishuEventService:
             },
             {
                 "stage": "gateway.app_credentials",
-                "ok": self.api_client.token_dialog_payload()["ok"],
-                "detail": self.api_client.token_dialog_payload(),
+                "ok": token_dialog["ok"],
+                "detail": token_dialog,
             },
             {
                 "stage": "gateway.encrypt_key",
-                "ok": not self._is_placeholder(feishu_cfg.encrypt_key),
-                "detail": {"set": bool(str(feishu_cfg.encrypt_key or "").strip())},
+                "ok": True,
+                "detail": {
+                    "optional": True,
+                    "enabled": bool(
+                        str(feishu_cfg.encrypt_key or "").strip()
+                        and not self._is_placeholder(feishu_cfg.encrypt_key)
+                    ),
+                    "set": bool(str(feishu_cfg.encrypt_key or "").strip()),
+                },
             },
             {
                 "stage": "gateway.verification_token",
                 "ok": not self._is_placeholder(feishu_cfg.verification_token),
                 "detail": {"set": bool(str(feishu_cfg.verification_token or "").strip())},
+            },
+            {
+                "stage": "gateway.target_chat_id",
+                "ok": True,
+                "detail": {
+                    "optional": True,
+                    "set": bool(
+                        str(feishu_cfg.target_chat_id or "").strip()
+                        and not self._is_placeholder(feishu_cfg.target_chat_id)
+                    ),
+                    "required_when": "event payload has no message_id",
+                },
             },
             {
                 "stage": "gateway.tenant_access_token",
@@ -197,7 +226,15 @@ class FeishuEventService:
                 }
             )
             reply_route = "event_reply"
-            if not checks["checks"][6]["ok"]:
+            tenant_token_ok = next(
+                (
+                    bool(item.get("ok", False))
+                    for item in checks.get("checks", [])
+                    if str(item.get("stage", "")).strip() == "gateway.tenant_access_token"
+                ),
+                False,
+            )
+            if not tenant_token_ok:
                 reply_route = "blocked_by_token"
             elif not self.config.gateway.feishu.target_chat_id:
                 reply_route = "event_reply_or_message_id_required"
@@ -297,13 +334,56 @@ class FeishuEventService:
             }
 
         query = self._extract_query(event_data)
-        result, progress_reply_result = self._run_query_flow(event_data=event_data, query=query)
+        run_id = self._build_run_id()
+        started_at = time.perf_counter()
+        event = self._extract_event(event_data)
+        message = event.get("message", {}) if isinstance(event, dict) else {}
+        event_id = str(event_data.get("event_id", "")).strip()
+        message_id = str(message.get("message_id", "")).strip() if isinstance(message, dict) else ""
+        query_hash = hashlib.md5(str(query or "").strip().encode("utf-8")).hexdigest()
+        self.memory_store.safe_call(
+            "start_run",
+            run_id=run_id,
+            channel="gateway",
+            event_id=event_id,
+            message_id=message_id,
+            query_text=str(query or "").strip(),
+            query_hash=query_hash,
+            retrieval_provider=str(getattr(self.config.search, "rag_provider", "legacy")).strip().lower() or "legacy",
+        )
+        self.memory_store.safe_call(
+            "append_io_snapshot",
+            run_id=run_id,
+            io_type="input",
+            producer="event_service",
+            content={"query": str(query or "").strip(), "event_id": event_id, "message_id": message_id},
+        )
+        result, progress_reply_result = self._run_query_flow(
+            event_data=event_data,
+            query=query,
+            run_id=run_id,
+        )
 
         reply_result = self._reply_to_event(event_data=event_data, text=result.message)
         payload = self._build_callback_payload(
             result=result,
             reply_result=reply_result,
             progress_reply_result=progress_reply_result,
+            run_id=run_id,
+        )
+        self._write_run_outputs(run_id=run_id, result=result)
+        self.memory_store.safe_call(
+            "finish_run",
+            run_id=run_id,
+            success=bool(result.success),
+            fallback_type=str(result.fallback_type or ""),
+            retrieval_provider=result.retrieval_provider,
+            retrieval_confidence=result.retrieval_confidence,
+            duration_ms=int((time.perf_counter() - started_at) * 1000),
+            error_stage=result.error_stage,
+            error_type=result.error_type,
+            error_message=result.error_message,
+            final_answer_preview=str(result.message or "")[:400],
         )
         self._log_debug_trace(event_data=event_data, result=payload)
         return payload
@@ -313,6 +393,7 @@ class FeishuEventService:
         *,
         event_data: dict[str, Any],
         query: str,
+        run_id: str | None = None,
     ) -> tuple[GatewayResult, dict[str, Any]]:
         if not query.strip():
             return (
@@ -324,7 +405,7 @@ class FeishuEventService:
                 {"ok": False, "error": "query_empty", "data": {}},
             )
         progress_reply_result = self._try_send_progress_reply(event_data=event_data, query=query)
-        return self._process_query(query), progress_reply_result
+        return self._process_query(query, run_id=run_id), progress_reply_result
 
     def _build_callback_payload(
         self,
@@ -332,6 +413,7 @@ class FeishuEventService:
         result: GatewayResult,
         reply_result: dict[str, Any],
         progress_reply_result: dict[str, Any],
+        run_id: str | None = None,
     ) -> dict[str, Any]:
         token_dialog = self.api_client.token_dialog_payload()
         return {
@@ -345,6 +427,7 @@ class FeishuEventService:
             "token_dialog": token_dialog if not token_dialog["ok"] else None,
             "embedding_dialog": result.embedding_dialog,
             "debug_trace": result.debug_trace,
+            "run_id": run_id,
             "timestamp": datetime.now(UTC).isoformat(),
         }
 
@@ -362,25 +445,41 @@ class FeishuEventService:
             return content
         return ""
 
-    def _process_query(self, query: str) -> GatewayResult:
+    def _process_query(self, query: str, *, run_id: str | None = None) -> GatewayResult:
         try:
-            response = self.agent.run_sync(query, include_trace=True)
+            response = self.agent.run_sync(
+                query,
+                include_trace=True,
+                run_id=run_id,
+                memory_store=self.memory_store,
+            )
         except TimeoutError:
             return GatewayResult(
                 success=False,
                 message=self._fallback_message("timeout"),
                 fallback_type="timeout",
                 debug_trace={"error": "timeout"},
+                error_stage="agent_run",
+                error_type="TimeoutError",
+                error_message="timeout",
             )
-        except Exception:
+        except Exception as exc:
             return GatewayResult(
                 success=False,
                 message=self._fallback_message("error"),
                 fallback_type="error",
-                debug_trace={"error": "internal_error"},
+                debug_trace={"error": "internal_error", "detail": str(exc)},
+                error_stage="agent_run",
+                error_type=type(exc).__name__,
+                error_message=str(exc),
             )
         embedding_dialog = self._embedding_dialog_from_trace(response.trace)
         debug_trace = self._extract_debug_trace(trace=response.trace, query=query)
+        retrieval_provider = (
+            str(response.trace.get("retrieval_provider", "")).strip()
+            if isinstance(response.trace, dict)
+            else ""
+        ) or str(getattr(self.config.search, "rag_provider", "legacy")).strip().lower() or "legacy"
 
         output_guardrail = self.config.guardrails.output
         if (
@@ -393,6 +492,9 @@ class FeishuEventService:
                 fallback_type="no_rag_hit",
                 embedding_dialog=embedding_dialog,
                 debug_trace=debug_trace,
+                retrieval_provider=retrieval_provider,
+                retrieval_confidence=float(response.retrieval_confidence or 0.0),
+                agent_trace=response.trace if isinstance(response.trace, dict) else {},
             )
 
         return GatewayResult(
@@ -400,7 +502,48 @@ class FeishuEventService:
             message=response.answer,
             embedding_dialog=embedding_dialog,
             debug_trace=debug_trace,
+            retrieval_provider=retrieval_provider,
+            retrieval_confidence=float(response.retrieval_confidence or 0.0),
+            agent_trace=response.trace if isinstance(response.trace, dict) else {},
         )
+
+    def _write_run_outputs(self, *, run_id: str, result: GatewayResult) -> None:
+        self.memory_store.safe_call(
+            "append_io_snapshot",
+            run_id=run_id,
+            io_type="output",
+            producer="event_service",
+            content={
+                "message": str(result.message or ""),
+                "success": bool(result.success),
+                "fallback_type": str(result.fallback_type or ""),
+            },
+        )
+        if isinstance(result.agent_trace, dict):
+            citations = result.agent_trace.get("final_citations", [])
+            if isinstance(citations, list):
+                self.memory_store.safe_call(
+                    "append_io_snapshot",
+                    run_id=run_id,
+                    io_type="final_citations",
+                    producer="event_service",
+                    content={"count": len(citations), "citations": citations},
+                )
+            self.memory_store.safe_call(
+                "append_io_snapshot",
+                run_id=run_id,
+                io_type="full_trace",
+                producer="event_service",
+                content=result.agent_trace,
+            )
+        elif isinstance(result.debug_trace, dict):
+            self.memory_store.safe_call(
+                "append_io_snapshot",
+                run_id=run_id,
+                io_type="debug_trace",
+                producer="event_service",
+                content=result.debug_trace,
+            )
 
     def _try_send_progress_reply(self, *, event_data: dict[str, Any], query: str) -> dict[str, Any]:
         if not self._should_send_search_progress(query):
@@ -438,9 +581,25 @@ class FeishuEventService:
         event = self._extract_event(event_data)
         message = event.get("message", {})
         message_id = str(message.get("message_id", "")).strip()
+        chat_id = str(message.get("chat_id", "")).strip()
         if message_id:
             reply = self.api_client.send_reply_text(message_id=message_id, text=text)
-            return {"ok": reply.ok, "error": reply.error, "data": reply.data}
+            if reply.ok:
+                return {"ok": True, "error": "", "data": reply.data}
+            if chat_id:
+                fallback = self.api_client.send_message_text(
+                    receive_id=chat_id,
+                    text=text,
+                    receive_id_type="chat_id",
+                )
+                if fallback.ok:
+                    return {"ok": True, "error": "", "data": fallback.data}
+                return {
+                    "ok": False,
+                    "error": f"reply_failed:{reply.error};chat_fallback_failed:{fallback.error}",
+                    "data": {"reply": reply.data, "chat_fallback": fallback.data},
+                }
+            return {"ok": False, "error": reply.error, "data": reply.data}
 
         target_chat_id = self.config.gateway.feishu.target_chat_id
         if target_chat_id:
@@ -585,15 +744,18 @@ class FeishuEventService:
         event = self._extract_event(event_data)
         message = event.get("message", {}) if isinstance(event, dict) else {}
         log_payload = {
+            "run_id": str(result.get("run_id", "")).strip(),
             "event_id": str(event_data.get("event_id", "")).strip(),
             "message_id": str(message.get("message_id", "")).strip() if isinstance(message, dict) else "",
             "fallback_type": result.get("fallback_type"),
             "success": bool(result.get("success", False)),
             "reply_ok": bool(result.get("reply_ok", False)),
-            "reply_error": str(result.get("reply_error", "")).strip(),
-            "debug_trace": result.get("debug_trace"),
         }
         logger.info("gateway_debug_trace %s", json.dumps(log_payload, ensure_ascii=False))
+
+    @staticmethod
+    def _build_run_id() -> str:
+        return f"run_{uuid4().hex}"
 
     @staticmethod
     def _is_placeholder(value: str) -> bool:
