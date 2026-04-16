@@ -52,14 +52,24 @@ class GenerationClient:
         system_prompt = get_system_prompt(answer_class)
 
         # 移除原有的format_instruction逻辑（已包含在prompt模板中）
-        evidence_block = "\n".join(f"- {line}" for line in evidence) if evidence else "- 无"
+        evidence_block = (
+            "\n".join(f"- {line}" for line in evidence) if evidence else "- 无"
+        )
         key_points_block = (
             "\n".join(f"- {line}" for line in (key_points or []) if str(line).strip())
             if key_points
             else "- 无"
         )
-        steps_block = "\n".join(f"{idx}. {line}" for idx, line in enumerate(steps, start=1)) if steps else "- 无"
-        citations_block = "\n".join(f"- {source}" for source in citation_sources) if citation_sources else "- 无"
+        steps_block = (
+            "\n".join(f"{idx}. {line}" for idx, line in enumerate(steps, start=1))
+            if steps
+            else "- 无"
+        )
+        citations_block = (
+            "\n".join(f"- {source}" for source in citation_sources)
+            if citation_sources
+            else "- 无"
+        )
 
         user_prompt = (
             f"用户问题：{query}\n\n"
@@ -96,7 +106,9 @@ class GenerationClient:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                with request.urlopen(req, timeout=self.timeout) as response:  # nosec B310
+                with request.urlopen(
+                    req, timeout=self.timeout
+                ) as response:  # nosec B310
                     body = response.read().decode("utf-8", errors="ignore")
                 data = json.loads(body)
                 content = self._extract_content(data)

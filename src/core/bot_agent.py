@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from collections.abc import Iterable
@@ -99,7 +99,9 @@ class ReActAgent:
             embedding_max_retries=config.embedding.max_retries,
             build_version=config.knowledge_base.build_version,
         )
-        self.manifest_store = ManifestStore(config.database.db_path, ensure_schema=False)
+        self.manifest_store = ManifestStore(
+            config.database.db_path, ensure_schema=False
+        )
         self.kb_status_service = KBStatusService(
             db_path=config.database.db_path,
             source_dir=config.knowledge_base.source_dir,
@@ -139,7 +141,9 @@ class ReActAgent:
             rerank_max_retries=config.search.rerank_max_retries,
         )
         self.rag_searcher = self._build_rag_searcher()
-        self.retrieval_provider = "ragflow" if self.rag_provider == "ragflow" else "legacy"
+        self.retrieval_provider = (
+            "ragflow" if self.rag_provider == "ragflow" else "legacy"
+        )
         self.planner = RulePlanner()
         self.query_analyzer = QueryAnalyzer()
         self.web_search_client = WebSearchClient(
@@ -171,7 +175,11 @@ class ReActAgent:
         self.qa_classifier = QAClassifier()
 
     def _resolve_rag_provider(self) -> str:
-        raw = str(getattr(getattr(self.config, "search", None), "rag_provider", "legacy")).strip().lower()
+        raw = (
+            str(getattr(getattr(self.config, "search", None), "rag_provider", "legacy"))
+            .strip()
+            .lower()
+        )
         return raw if raw in {"legacy", "ragflow"} else "legacy"
 
     def _build_rag_searcher(self) -> RAGSearcher | RAGFlowSearcher:
@@ -206,7 +214,10 @@ class ReActAgent:
             self.answer_top_k = max(1, int(getattr(self, "answer_top_k", 3)))
         except Exception:
             self.answer_top_k = 3
-        provider = str(getattr(self, "retrieval_provider", "legacy")).strip().lower() or "legacy"
+        provider = (
+            str(getattr(self, "retrieval_provider", "legacy")).strip().lower()
+            or "legacy"
+        )
 
         manifest_gate = self._manifest_gate_snapshot()
         manifest = manifest_gate.get("manifest", {})
@@ -248,7 +259,10 @@ class ReActAgent:
         confidence_from_search = 0.0
         results: list[SearchHit] = []
         search_trace = {}
-        if hasattr(self, "search_orchestrator") and self.search_orchestrator is not None:
+        if (
+            hasattr(self, "search_orchestrator")
+            and self.search_orchestrator is not None
+        ):
             if hasattr(self.search_orchestrator, "answer_top_k"):
                 self.search_orchestrator.answer_top_k = self.answer_top_k
             try:
@@ -262,12 +276,16 @@ class ReActAgent:
                 orchestrator_result = self.search_orchestrator.search_with_trace(query)
             results = self._coerce_search_hits(orchestrator_result.hits)
             search_trace = (
-                orchestrator_result.trace_search if isinstance(orchestrator_result.trace_search, dict) else {}
+                orchestrator_result.trace_search
+                if isinstance(orchestrator_result.trace_search, dict)
+                else {}
             )
             raw_citations = getattr(orchestrator_result, "citations", None)
             if isinstance(raw_citations, list):
                 citations_from_search = raw_citations
-            confidence_from_search = float(getattr(orchestrator_result, "retrieval_confidence", 0.0) or 0.0)
+            confidence_from_search = float(
+                getattr(orchestrator_result, "retrieval_confidence", 0.0) or 0.0
+            )
         else:
             searcher = getattr(self, "searcher", None) or self.rag_searcher
             rag_results, search_trace = searcher.search_with_trace(query)
@@ -278,7 +296,10 @@ class ReActAgent:
         search_trace["manifest_gate"] = dict(manifest_gate)
         search_trace["retrieval_provider"] = provider
 
-        if not (hasattr(self, "search_orchestrator") and self.search_orchestrator is not None):
+        if not (
+            hasattr(self, "search_orchestrator")
+            and self.search_orchestrator is not None
+        ):
             # Legacy execution path kept for compatibility when orchestrator is not injected.
             query_analysis = QueryAnalysis(
                 temporal_intent_score=0.0,
@@ -307,8 +328,12 @@ class ReActAgent:
                 need_web_search=bool(query_analysis.need_web_search),
                 reasons=list(query_analysis.reasons),
                 metrics={
-                    "temporal_intent_score": float(query_analysis.temporal_intent_score),
-                    "domain_relevance_score": float(query_analysis.domain_relevance_score),
+                    "temporal_intent_score": float(
+                        query_analysis.temporal_intent_score
+                    ),
+                    "domain_relevance_score": float(
+                        query_analysis.domain_relevance_score
+                    ),
                     "oov_entity_score": float(query_analysis.oov_entity_score),
                     "kb_coverage_score": float(query_analysis.kb_coverage_score),
                     "kb_result_count": len(results),
@@ -343,11 +368,17 @@ class ReActAgent:
             search_trace["web"] = web_trace
 
         self._normalize_web_trace(search_trace)
-        trace = build_agent_trace(query=query, search_trace=search_trace, manifest=manifest or {})
+        trace = build_agent_trace(
+            query=query, search_trace=search_trace, manifest=manifest or {}
+        )
         trace["retrieval_provider"] = provider
 
         if not results:
-            planner_trace = search_trace.get("planner", {}) if isinstance(search_trace, dict) else {}
+            planner_trace = (
+                search_trace.get("planner", {})
+                if isinstance(search_trace, dict)
+                else {}
+            )
             allow_rag = True
             filter_reason = str(planner_trace.get("filter_reason", "")).strip()
 
@@ -383,7 +414,9 @@ class ReActAgent:
 
         selected = results[: self.answer_top_k]
         citations = citations_from_search or self._build_citations(selected)
-        draft = self._build_answer_draft(query=query, selected=selected, citations=citations)
+        draft = self._build_answer_draft(
+            query=query, selected=selected, citations=citations
+        )
         template_answer = self._render_template_answer(draft)
         answer, generation_meta = self._compose_answer(
             draft=draft,
@@ -392,7 +425,10 @@ class ReActAgent:
         )
         confidence = max(
             confidence_from_search,
-            min(1.0, sum(max(0.0, item.score) for item in selected) / max(len(selected), 1)),
+            min(
+                1.0,
+                sum(max(0.0, item.score) for item in selected) / max(len(selected), 1),
+            ),
         )
 
         trace["strategy_execution"].append(
@@ -426,10 +462,15 @@ class ReActAgent:
         include_trace: bool = False,
         manifest_gate: dict[str, Any] | None = None,
     ) -> AgentResponse | None:
-        provider = str(getattr(self, "retrieval_provider", "legacy")).strip().lower() or "legacy"
+        provider = (
+            str(getattr(self, "retrieval_provider", "legacy")).strip().lower()
+            or "legacy"
+        )
         orchestrator = getattr(self, "search_orchestrator", None)
         required_methods = ("run_l1_partial", "route_by_l1_confidence", "run_l2_full")
-        if orchestrator is None or not all(hasattr(orchestrator, name) for name in required_methods):
+        if orchestrator is None or not all(
+            hasattr(orchestrator, name) for name in required_methods
+        ):
             return None
 
         if hasattr(orchestrator, "answer_top_k"):
@@ -443,12 +484,20 @@ class ReActAgent:
 
         manifest_gate_payload = dict(manifest_gate or {})
         manifest = manifest_gate_payload.get("manifest", {})
-        l1_confidence = float(getattr(decision, "l1_confidence", getattr(l1_result, "confidence", 0.0)) or 0.0)
+        l1_confidence = float(
+            getattr(decision, "l1_confidence", getattr(l1_result, "confidence", 0.0))
+            or 0.0
+        )
         threshold = float(getattr(decision, "threshold", 0.58) or 0.58)
         trigger_full_rag = bool(getattr(decision, "trigger_full_rag", True))
-        reason_code = str(getattr(decision, "reason_code", LOW_RELEVANCE_REASON_CODE) or LOW_RELEVANCE_REASON_CODE)
+        reason_code = str(
+            getattr(decision, "reason_code", LOW_RELEVANCE_REASON_CODE)
+            or LOW_RELEVANCE_REASON_CODE
+        )
 
-        template_enabled = bool(getattr(getattr(self.config, "search", None), "l1_template_enabled", True))
+        template_enabled = bool(
+            getattr(getattr(self.config, "search", None), "l1_template_enabled", True)
+        )
         if not template_enabled:
             trigger_full_rag = True
             reason_code = "L1_TEMPLATE_DISABLED"
@@ -478,7 +527,9 @@ class ReActAgent:
                 },
             )
             self._normalize_web_trace(search_trace)
-            trace = build_agent_trace(query=query, search_trace=search_trace, manifest=manifest or {})
+            trace = build_agent_trace(
+                query=query, search_trace=search_trace, manifest=manifest or {}
+            )
             trace["retrieval_provider"] = provider
             trace["strategy_execution"].append(
                 {
@@ -512,7 +563,9 @@ class ReActAgent:
         search_trace["retrieval_provider"] = provider
         self._normalize_web_trace(search_trace)
 
-        trace = build_agent_trace(query=query, search_trace=search_trace, manifest=manifest or {})
+        trace = build_agent_trace(
+            query=query, search_trace=search_trace, manifest=manifest or {}
+        )
         trace["retrieval_provider"] = provider
         trace["strategy_execution"].append(
             {
@@ -525,7 +578,11 @@ class ReActAgent:
         )
 
         if not results:
-            planner_trace = search_trace.get("planner", {}) if isinstance(search_trace, dict) else {}
+            planner_trace = (
+                search_trace.get("planner", {})
+                if isinstance(search_trace, dict)
+                else {}
+            )
             filter_reason = str(planner_trace.get("filter_reason", "")).strip()
             reason = (
                 TraceFallbackReason.INDEX_NOT_READY.value
@@ -552,8 +609,14 @@ class ReActAgent:
 
         selected = results[: self.answer_top_k]
         raw_citations = getattr(l2_result, "citations", None)
-        citations = raw_citations if isinstance(raw_citations, list) else self._build_citations(selected)
-        draft = self._build_answer_draft(query=query, selected=selected, citations=citations)
+        citations = (
+            raw_citations
+            if isinstance(raw_citations, list)
+            else self._build_citations(selected)
+        )
+        draft = self._build_answer_draft(
+            query=query, selected=selected, citations=citations
+        )
         template_answer = self._render_template_answer(draft)
         answer, generation_meta = self._compose_answer(
             draft=draft,
@@ -562,7 +625,10 @@ class ReActAgent:
         )
         confidence = max(
             float(getattr(l2_result, "retrieval_confidence", 0.0) or 0.0),
-            min(1.0, sum(max(0.0, item.score) for item in selected) / max(len(selected), 1)),
+            min(
+                1.0,
+                sum(max(0.0, item.score) for item in selected) / max(len(selected), 1),
+            ),
         )
 
         trace["strategy_execution"].append(
@@ -623,7 +689,9 @@ class ReActAgent:
                 }
 
             manifest = raw_manifest if isinstance(raw_manifest, dict) else {}
-            ready, reason, status = is_index_ready(manifest, self._index_counts_snapshot())
+            ready, reason, status = is_index_ready(
+                manifest, self._index_counts_snapshot()
+            )
             return {
                 "ready": bool(ready),
                 "blocked": not bool(ready),
@@ -674,7 +742,9 @@ class ReActAgent:
                 }
 
             manifest = raw_manifest if isinstance(raw_manifest, dict) else {}
-            ready, reason, status = is_index_ready(manifest, self._index_counts_snapshot())
+            ready, reason, status = is_index_ready(
+                manifest, self._index_counts_snapshot()
+            )
             return {
                 "ready": bool(ready),
                 "blocked": not bool(ready),
@@ -718,7 +788,9 @@ class ReActAgent:
         enabled = bool(self.config.search.web_search_enabled)
         kb_empty = len(local_results) == 0
         need_web_search = bool(query_analysis.need_web_search) or kb_empty
-        reasons = [str(reason) for reason in query_analysis.reasons if str(reason).strip()]
+        reasons = [
+            str(reason) for reason in query_analysis.reasons if str(reason).strip()
+        ]
         if kb_empty:
             reasons = self._merge_reasons(reasons, ["kb_empty_triggered_web_fallback"])
         web_trace = build_web_trace(
@@ -756,7 +828,9 @@ class ReActAgent:
             error_reasons = [TraceFallbackReason.WEB_SEARCH_ERROR.value]
             if TraceFallbackReason.PROVIDER_MISCONFIGURED.value in error_text:
                 error_reasons.append(TraceFallbackReason.PROVIDER_MISCONFIGURED.value)
-            web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], error_reasons)
+            web_trace["reasons"] = self._merge_reasons(
+                web_trace["reasons"], error_reasons
+            )
             web_trace["error"] = error_text
             return local_results, web_trace
 
@@ -769,14 +843,18 @@ class ReActAgent:
             )
             return local_results, web_trace
 
-        evaluation = self.web_result_evaluator.evaluate(query=query, results=web_results)
+        evaluation = self.web_result_evaluator.evaluate(
+            query=query, results=web_results
+        )
         decision = self.web_router.route(
             query=query,
             analysis=query_analysis,
             evaluation=evaluation,
         )
         web_trace["fusion_strategy"] = decision.fusion_strategy
-        web_trace["reasons"] = self._merge_reasons(web_trace["reasons"], decision.reasons)
+        web_trace["reasons"] = self._merge_reasons(
+            web_trace["reasons"], decision.reasons
+        )
         web_trace["metrics"].update(decision.metrics)
         web_trace["fallback_used"] = bool(decision.fallback)
 
@@ -820,8 +898,14 @@ class ReActAgent:
     ) -> list[SearchHit]:
         limit = max(self.answer_top_k * 3, self.answer_top_k)
         web_limit = min(int(self.config.search.web_rag_max_docs), 8)
-        web_rows = self._convert_web_results(query=query, web_results=web_results[:web_limit])
-        ordered = sorted(web_rows + list(local_results), key=lambda row: float(getattr(row, "score", 0.0)), reverse=True)
+        web_rows = self._convert_web_results(
+            query=query, web_results=web_results[:web_limit]
+        )
+        ordered = sorted(
+            web_rows + list(local_results),
+            key=lambda row: float(getattr(row, "score", 0.0)),
+            reverse=True,
+        )
         return self._dedupe_results(ordered, limit=limit)
 
     def _build_rag_fusion_results(
@@ -842,9 +926,13 @@ class ReActAgent:
             content = str(getattr(row, "content", "")).lower()
             overlap = 0.0
             if query_terms:
-                overlap = sum(1 for token in query_terms if token in content) / len(query_terms)
+                overlap = sum(1 for token in query_terms if token in content) / len(
+                    query_terms
+                )
             source_path = str(getattr(row, "source_path", ""))
-            traceable_bonus = 0.06 if source_path.startswith(("http://", "https://")) else 0.0
+            traceable_bonus = (
+                0.06 if source_path.startswith(("http://", "https://")) else 0.0
+            )
             final_score = min(1.0, base_score * 0.75 + overlap * 0.19 + traceable_bonus)
             scored_rows.append((final_score, row))
 
@@ -866,7 +954,9 @@ class ReActAgent:
         for index, row in enumerate(web_results, start=1):
             text = f"{row.title} {row.snippet}".strip()
             if query_terms:
-                overlap = sum(1 for token in query_terms if token in text.lower()) / len(query_terms)
+                overlap = sum(
+                    1 for token in query_terms if token in text.lower()
+                ) / len(query_terms)
             else:
                 overlap = 0.0
             score = min(1.0, max(float(row.score), 0.45 + overlap * 0.45))
@@ -967,7 +1057,9 @@ class ReActAgent:
         if classification.answer_class == "open":
             steps = self._build_thematic_steps(theme=theme, query_terms=query_terms)
 
-        source_rows, source_tags = self._build_source_rows(selected=selected, citations=citations)
+        source_rows, source_tags = self._build_source_rows(
+            selected=selected, citations=citations
+        )
         if not source_rows:
             source_rows = ["[S1] 无可用来源 | 片段缺失 | reference"]
             source_tags = ["S1"]
@@ -976,14 +1068,22 @@ class ReActAgent:
         filtered_facts = self._filter_facts_by_qa_mapping(facts=fact_units, query=query)
         source_tag_map = self._source_tag_map_from_rows(source_rows)
 
-        key_points = self._build_key_points(query=query, evidence=evidence, selected=selected, limit=4)
-        point_source_tags = [source_tags[idx % len(source_tags)] for idx, _ in enumerate(key_points)] if key_points else []
+        key_points = self._build_key_points(
+            query=query, evidence=evidence, selected=selected, limit=4
+        )
+        point_source_tags = (
+            [source_tags[idx % len(source_tags)] for idx, _ in enumerate(key_points)]
+            if key_points
+            else []
+        )
 
         # Q-A类优先使用fact_units
         if classification.answer_class == "qa" and filtered_facts:
-            key_points = [str(fact.get("statement", "")).strip()
-                          for fact in filtered_facts[:4]
-                          if str(fact.get("statement", "")).strip()]
+            key_points = [
+                str(fact.get("statement", "")).strip()
+                for fact in filtered_facts[:4]
+                if str(fact.get("statement", "")).strip()
+            ]
             point_source_tags = [
                 source_tag_map.get(str(fact.get("source", "")).strip(), source_tags[0])
                 for fact in filtered_facts[: len(key_points)]
@@ -1034,9 +1134,13 @@ class ReActAgent:
             return template_answer, generation_meta
 
         try:
-            rewritten = self._hybrid_rewrite(draft=draft, template_answer=template_answer)
+            rewritten = self._hybrid_rewrite(
+                draft=draft, template_answer=template_answer
+            )
         except Exception as exc:
-            generation_meta["fallback_reason"] = GenerationFallbackReason.HYBRID_UNAVAILABLE_OR_ERROR.value
+            generation_meta["fallback_reason"] = (
+                GenerationFallbackReason.HYBRID_UNAVAILABLE_OR_ERROR.value
+            )
             generation_meta["error"] = str(exc)
             return template_answer, generation_meta
 
@@ -1048,23 +1152,38 @@ class ReActAgent:
         generation_meta["quality_score"] = round(quality_score, 4)
         generation_meta["claim_support_rate"] = round(claim_support_rate, 4)
         generation_meta["citation_coverage"] = round(citation_coverage, 4)
-        generation_meta["point_source_binding_rate"] = round(point_source_binding_rate, 4)
+        generation_meta["point_source_binding_rate"] = round(
+            point_source_binding_rate, 4
+        )
         if quality_issues:
             generation_meta["quality_issues"] = quality_issues
 
         if quality_score < float(self.config.generation.min_quality_score):
-            generation_meta["fallback_reason"] = GenerationFallbackReason.QUALITY_BELOW_THRESHOLD.value
+            generation_meta["fallback_reason"] = (
+                GenerationFallbackReason.QUALITY_BELOW_THRESHOLD.value
+            )
             return template_answer, generation_meta
         if claim_support_rate < float(self.config.generation.min_claim_support_rate):
-            generation_meta["fallback_reason"] = GenerationFallbackReason.CLAIM_SUPPORT_BELOW_THRESHOLD.value
+            generation_meta["fallback_reason"] = (
+                GenerationFallbackReason.CLAIM_SUPPORT_BELOW_THRESHOLD.value
+            )
             return template_answer, generation_meta
         if citation_coverage < float(self.config.generation.min_citation_coverage):
-            generation_meta["fallback_reason"] = GenerationFallbackReason.CITATION_COVERAGE_BELOW_THRESHOLD.value
+            generation_meta["fallback_reason"] = (
+                GenerationFallbackReason.CITATION_COVERAGE_BELOW_THRESHOLD.value
+            )
             return template_answer, generation_meta
-        if bool(getattr(self.config.generation, "force_point_source_format", True)) and not self._paragraph_output_enabled():
-            min_binding = float(getattr(self.config.generation, "min_point_source_binding_rate", 1.0))
+        if (
+            bool(getattr(self.config.generation, "force_point_source_format", True))
+            and not self._paragraph_output_enabled()
+        ):
+            min_binding = float(
+                getattr(self.config.generation, "min_point_source_binding_rate", 1.0)
+            )
             if point_source_binding_rate < min_binding:
-                generation_meta["fallback_reason"] = "point_source_binding_below_threshold"
+                generation_meta["fallback_reason"] = (
+                    "point_source_binding_below_threshold"
+                )
                 return template_answer, generation_meta
 
         generation_meta["final_mode"] = "hybrid"
@@ -1089,9 +1208,13 @@ class ReActAgent:
             if isinstance(branch_errors, dict) and branch_errors:
                 # Keep generation enabled when at least one retrieval branch is healthy.
                 if "vec" in branch_errors and not has_fts:
-                    return GenerationFallbackReason.VECTOR_BRANCH_ERROR_NO_LEXICAL_BACKUP.value
+                    return (
+                        GenerationFallbackReason.VECTOR_BRANCH_ERROR_NO_LEXICAL_BACKUP.value
+                    )
                 if "fts" in branch_errors and not has_vec:
-                    return GenerationFallbackReason.FTS_BRANCH_ERROR_NO_VECTOR_BACKUP.value
+                    return (
+                        GenerationFallbackReason.FTS_BRANCH_ERROR_NO_VECTOR_BACKUP.value
+                    )
 
         errors = search_trace.get("errors", [])
         if isinstance(errors, list) and errors and not (has_fts or has_vec):
@@ -1122,7 +1245,9 @@ class ReActAgent:
         )
         return rewritten.strip()
 
-    def _evaluate_answer_quality(self, answer: str, draft: AnswerDraft) -> tuple[float, list[str]]:
+    def _evaluate_answer_quality(
+        self, answer: str, draft: AnswerDraft
+    ) -> tuple[float, list[str]]:
         score = 1.0
         issues: list[str] = []
         paragraph_output = self._paragraph_output_enabled()
@@ -1131,12 +1256,18 @@ class ReActAgent:
             required_sections = ["要点：", "来源："]
             if draft.answer_mode in {"procedure", "mixed"} and draft.steps:
                 required_sections.append("执行建议：")
-        missing_sections = [section for section in required_sections if section not in answer]
+        missing_sections = [
+            section for section in required_sections if section not in answer
+        ]
         if missing_sections:
             score -= 0.45
             issues.append(f"missing_sections:{','.join(missing_sections)}")
 
-        if not paragraph_output and draft.answer_mode in {"procedure", "mixed"} and draft.steps:
+        if (
+            not paragraph_output
+            and draft.answer_mode in {"procedure", "mixed"}
+            and draft.steps
+        ):
             step_count = len(re.findall(r"(?m)^\\d+\\.\\s+", answer))
             if step_count < min(2, len(draft.steps)):
                 score -= 0.08
@@ -1187,12 +1318,17 @@ class ReActAgent:
             claim_tokens = self._text_tokens(claim)
             if not claim_tokens:
                 continue
-            best = max((self._token_overlap(claim_tokens, row) for row in evidence_tokens), default=0.0)
+            best = max(
+                (self._token_overlap(claim_tokens, row) for row in evidence_tokens),
+                default=0.0,
+            )
             if best >= 0.12:
                 supported += 1
         return supported / max(len(claims), 1)
 
-    def _estimate_citation_coverage(self, answer: str, citations: list[dict[str, Any]]) -> float:
+    def _estimate_citation_coverage(
+        self, answer: str, citations: list[dict[str, Any]]
+    ) -> float:
         expected_sources = [
             str(citation.get("source", "")).strip().lower()
             for citation in citations
@@ -1207,7 +1343,9 @@ class ReActAgent:
     def _readability_ratio(self, text: str) -> float:
         if not text.strip():
             return 0.0
-        readable = re.findall(r"[A-Za-z0-9\u4e00-\u9fff，。！？；：、（）\\[\\]\\- .:\n]", text)
+        readable = re.findall(
+            r"[A-Za-z0-9\u4e00-\u9fff，。！？；：、（）\\[\\]\\- .:\n]", text
+        )
         return len(readable) / max(len(text), 1)
 
     def _split_claims(self, answer: str) -> list[str]:
@@ -1302,12 +1440,18 @@ class ReActAgent:
 
     def _build_human_answer(self, *, query: str, selected: list[Any]) -> str:
         citations = self._build_citations(selected)
-        draft = self._build_answer_draft(query=query, selected=selected, citations=citations)
+        draft = self._build_answer_draft(
+            query=query, selected=selected, citations=citations
+        )
         return self._render_template_answer(draft)
 
     def _route_answer_mode(self, *, query: str, selected: list[Any]) -> str:
         query_lower = str(query or "").lower()
-        default_mode = str(getattr(self.config.generation, "default_answer_mode", "fact_qa")).strip().lower()
+        default_mode = (
+            str(getattr(self.config.generation, "default_answer_mode", "fact_qa"))
+            .strip()
+            .lower()
+        )
         if default_mode not in {"fact_qa", "procedure", "mixed"}:
             default_mode = "fact_qa"
 
@@ -1357,7 +1501,9 @@ class ReActAgent:
             return "mixed"
         return default_mode
 
-    def _build_key_points(self, *, query: str, evidence: list[str], selected: list[Any], limit: int) -> list[str]:
+    def _build_key_points(
+        self, *, query: str, evidence: list[str], selected: list[Any], limit: int
+    ) -> list[str]:
         points: list[str] = []
         seen: set[str] = set()
         for sentence in evidence:
@@ -1403,8 +1549,12 @@ class ReActAgent:
             source = str(getattr(item, "source", "")).strip()
             if not source:
                 continue
-            section = str(getattr(item, "section_path", "") or getattr(item, "section_title", "")).strip()
-            chunk_kind = str(getattr(item, "chunk_kind", "procedure")).strip() or "procedure"
+            section = str(
+                getattr(item, "section_path", "") or getattr(item, "section_title", "")
+            ).strip()
+            chunk_kind = (
+                str(getattr(item, "chunk_kind", "procedure")).strip() or "procedure"
+            )
             if not section:
                 section = self._infer_section_locator(item)
             existing = source_meta.get(source)
@@ -1436,7 +1586,9 @@ class ReActAgent:
 
         for idx, source in enumerate(ordered_sources, start=1):
             tag = f"S{idx}"
-            meta = source_meta.get(source, {"section": "片段定位缺失", "kind": "reference"})
+            meta = source_meta.get(
+                source, {"section": "片段定位缺失", "kind": "reference"}
+            )
             rows.append(f"[{tag}] {source} | {meta['section']} | {meta['kind']}")
             tags.append(tag)
         return rows, tags
@@ -1451,9 +1603,21 @@ class ReActAgent:
             mapping[source.strip()] = tag.strip()
         return mapping
 
-    def _extract_fact_units(self, *, selected: list[Any], query: str) -> list[dict[str, Any]]:
+    def _extract_fact_units(
+        self, *, selected: list[Any], query: str
+    ) -> list[dict[str, Any]]:
         query_terms = self._query_terms(query)
-        relation_markers = ("=", "+", "组成", "构成", "包括", "由", "等于", "包含", "含")
+        relation_markers = (
+            "=",
+            "+",
+            "组成",
+            "构成",
+            "包括",
+            "由",
+            "等于",
+            "包含",
+            "含",
+        )
         incoterms = ("fob", "cfr", "cif", "exw")
         component_markers = (
             "国内运费",
@@ -1483,15 +1647,29 @@ class ReActAgent:
                 if not any(term in lowered for term in incoterms):
                     continue
 
-                has_relation = any(marker in text or marker in lowered for marker in relation_markers)
+                has_relation = any(
+                    marker in text or marker in lowered for marker in relation_markers
+                )
                 if not has_relation:
                     continue
 
-                subject = next((term.upper() for term in incoterms if term in lowered), "")
-                relation = "equation" if ("=" in text or "等于" in text or "公式" in text) else "composition"
-                objects = [marker for marker in component_markers if marker in lowered or marker in text]
+                subject = next(
+                    (term.upper() for term in incoterms if term in lowered), ""
+                )
+                relation = (
+                    "equation"
+                    if ("=" in text or "等于" in text or "公式" in text)
+                    else "composition"
+                )
+                objects = [
+                    marker
+                    for marker in component_markers
+                    if marker in lowered or marker in text
+                ]
                 overlap = sum(1 for token in query_terms if token and token in lowered)
-                confidence = min(1.0, 0.35 + 0.18 * overlap + 0.08 * len(objects) - 0.03 * (rank - 1))
+                confidence = min(
+                    1.0, 0.35 + 0.18 * overlap + 0.08 * len(objects) - 0.03 * (rank - 1)
+                )
                 dedupe_key = f"{source.lower()}::{re.sub(r'\\s+', ' ', text.lower())}"
                 if dedupe_key in seen:
                     continue
@@ -1511,19 +1689,32 @@ class ReActAgent:
             key=lambda row: (
                 float(row.get("confidence", 0.0)),
                 1 if str(row.get("relation", "")) == "equation" else 0,
-                len(row.get("objects", [])) if isinstance(row.get("objects"), list) else 0,
+                (
+                    len(row.get("objects", []))
+                    if isinstance(row.get("objects"), list)
+                    else 0
+                ),
             ),
             reverse=True,
         )
         return facts[:12]
 
-    def _filter_facts_by_qa_mapping(self, *, facts: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    def _filter_facts_by_qa_mapping(
+        self, *, facts: list[dict[str, Any]], query: str
+    ) -> list[dict[str, Any]]:
         if not facts:
             return []
 
         query_lower = str(query or "").lower()
-        relation_query = any(marker in query_lower for marker in ("组成", "构成", "公式", "计算", "等于", "包含"))
-        target_subjects = {marker.upper() for marker in ("fob", "cfr", "cif", "exw") if marker in query_lower}
+        relation_query = any(
+            marker in query_lower
+            for marker in ("组成", "构成", "公式", "计算", "等于", "包含")
+        )
+        target_subjects = {
+            marker.upper()
+            for marker in ("fob", "cfr", "cif", "exw")
+            if marker in query_lower
+        }
 
         primary: list[dict[str, Any]] = []
         support: list[dict[str, Any]] = []
@@ -1532,13 +1723,20 @@ class ReActAgent:
             subject = str(fact.get("subject", "")).upper()
             relation = str(fact.get("relation", ""))
 
-            direct_subject_hit = bool(target_subjects) and (subject in target_subjects or any(token.lower() in statement for token in target_subjects))
+            direct_subject_hit = bool(target_subjects) and (
+                subject in target_subjects
+                or any(token.lower() in statement for token in target_subjects)
+            )
             relation_ok = relation in {"equation", "composition"}
             if direct_subject_hit and relation_ok:
                 primary.append(fact)
                 continue
 
-            if relation_query and relation_ok and any(marker in statement for marker in ("fob", "cfr", "cif", "exw")):
+            if (
+                relation_query
+                and relation_ok
+                and any(marker in statement for marker in ("fob", "cfr", "cif", "exw"))
+            ):
                 support.append(fact)
 
         if primary:
@@ -1547,7 +1745,9 @@ class ReActAgent:
             return support[:4]
         return facts[:4]
 
-    def _compose_paragraph_answer(self, *, facts: list[dict[str, Any]], draft: AnswerDraft) -> str:
+    def _compose_paragraph_answer(
+        self, *, facts: list[dict[str, Any]], draft: AnswerDraft
+    ) -> str:
         source_tag_map = self._source_tag_map_from_rows(draft.source_rows)
         facts_for_answer = facts or [
             {"statement": point, "source": ""}
@@ -1555,7 +1755,12 @@ class ReActAgent:
             if str(point).strip()
         ]
         if not facts_for_answer:
-            facts_for_answer = [{"statement": "当前检索证据不足，无法给出可验证的关系结论。", "source": ""}]
+            facts_for_answer = [
+                {
+                    "statement": "当前检索证据不足，无法给出可验证的关系结论。",
+                    "source": "",
+                }
+            ]
 
         tagged_statements: list[str] = []
         seen: set[str] = set()
@@ -1605,18 +1810,28 @@ class ReActAgent:
         lines.append("来源：")
         for row in draft.source_rows:
             lines.append(f"- {row}")
-        return "\n\n".join(lines[:2]) + ("\n\n" + "\n".join(lines[2:]) if len(lines) > 2 else "")
+        return "\n\n".join(lines[:2]) + (
+            "\n\n" + "\n".join(lines[2:]) if len(lines) > 2 else ""
+        )
 
-    def _append_terminal_punctuation(self, text: str, *, allow_semicolon: bool = True) -> str:
+    def _append_terminal_punctuation(
+        self, text: str, *, allow_semicolon: bool = True
+    ) -> str:
         stripped = str(text or "").strip()
         if not stripped:
             return stripped
-        if self._has_terminal_punctuation(stripped) or self._looks_truncated_fragment(stripped):
+        if self._has_terminal_punctuation(stripped) or self._looks_truncated_fragment(
+            stripped
+        ):
             return stripped
-        punct = self._choose_fallback_punctuation(stripped, allow_semicolon=allow_semicolon)
+        punct = self._choose_fallback_punctuation(
+            stripped, allow_semicolon=allow_semicolon
+        )
         return f"{stripped}{punct}"
 
-    def _choose_fallback_punctuation(self, text: str, *, allow_semicolon: bool = True) -> str:
+    def _choose_fallback_punctuation(
+        self, text: str, *, allow_semicolon: bool = True
+    ) -> str:
         normalized = self._strip_trailing_source_tags(text)
         if allow_semicolon and self._looks_formula_or_enumeration(normalized):
             return "；"
@@ -1630,7 +1845,11 @@ class ReActAgent:
         normalized = self._strip_trailing_source_tags(text)
         if not normalized:
             return False
-        if re.search(r"(和|及|与|等|包括|为|to|and|or|with|including|include)$", normalized, re.IGNORECASE):
+        if re.search(
+            r"(和|及|与|等|包括|为|to|and|or|with|including|include)$",
+            normalized,
+            re.IGNORECASE,
+        ):
             return True
         if normalized.endswith(("+", "-", "/", "=", "（", "(", "、", "，", ",")):
             return True
@@ -1687,18 +1906,24 @@ class ReActAgent:
         line = str(text or "").strip()
         if not line:
             return True
-        if re.fullmatch(r"\d+(?:\.\d+){1,6}\s*[\u4e00-\u9fffA-Za-z0-9_()（）-]{0,50}", line):
+        if re.fullmatch(
+            r"\d+(?:\.\d+){1,6}\s*[\u4e00-\u9fffA-Za-z0-9_()（）-]{0,50}", line
+        ):
             return True
         if re.search(r"[.·。]{3,}\s*\d{1,4}$", line):
             return True
-        if len(line) <= 18 and re.fullmatch(r"[\d.\-_/()（）\sA-Za-z\u4e00-\u9fff]+", line):
+        if len(line) <= 18 and re.fullmatch(
+            r"[\d.\-_/()（）\sA-Za-z\u4e00-\u9fff]+", line
+        ):
             if len(re.findall(r"[\u4e00-\u9fffA-Za-z]", line)) <= 6:
                 return True
         return False
 
     def _detect_theme(self, query: str, selected: list[Any]) -> str:
         query_text = str(query or "").lower()
-        source_text = " ".join(str(getattr(item, "source", "")) for item in selected).lower()
+        source_text = " ".join(
+            str(getattr(item, "source", "")) for item in selected
+        ).lower()
         theme_keywords = {
             "product_selection": ["选品", "类目", "需求", "利润", "竞争"],
             "listing": ["listing", "标题", "主图", "关键词", "五点"],
@@ -1752,10 +1977,21 @@ class ReActAgent:
         }
         return mapping.get(theme, mapping["general"])
 
-    def _extract_evidence(self, *, query: str, selected: list[Any], limit: int) -> list[str]:
+    def _extract_evidence(
+        self, *, query: str, selected: list[Any], limit: int
+    ) -> list[str]:
         query_terms = self._query_terms(query)
         query_has_cjk = bool(re.search(r"[\u4e00-\u9fff]", query))
-        action_markers = ("建议", "需要", "必须", "应当", "步骤", "流程", "should", "must")
+        action_markers = (
+            "建议",
+            "需要",
+            "必须",
+            "应当",
+            "步骤",
+            "流程",
+            "should",
+            "must",
+        )
         scored: list[tuple[float, str]] = []
         seen_sentences: set[str] = set()
 
@@ -1774,7 +2010,11 @@ class ReActAgent:
                     continue
                 seen_sentences.add(key)
                 hit_count = sum(1 for term in query_terms if term and term in key)
-                marker_bonus = 1 if any(marker in normalized.lower() for marker in action_markers) else 0
+                marker_bonus = (
+                    1
+                    if any(marker in normalized.lower() for marker in action_markers)
+                    else 0
+                )
                 source_bonus = max(0.0, 0.5 - 0.1 * (rank - 1))
                 length_penalty = 0.2 if len(normalized) > 100 else 0.0
                 score = hit_count + marker_bonus + source_bonus - length_penalty
@@ -1818,7 +2058,15 @@ class ReActAgent:
         if not cleaned:
             return False
         lowered = cleaned.lower()
-        noise_markers = ("flatedecode", "xref", "obj", "endobj", "stream", "/filter", "/length")
+        noise_markers = (
+            "flatedecode",
+            "xref",
+            "obj",
+            "endobj",
+            "stream",
+            "/filter",
+            "/length",
+        )
         if any(marker in lowered for marker in noise_markers):
             return False
         # Accept normal Chinese lines first; this avoids regex-escape edge cases
@@ -1832,10 +2080,3 @@ class ReActAgent:
             return False
         english_words = re.findall(r"[A-Za-z]{2,}", cleaned)
         return len(english_words) >= 3
-
-
-
-
-
-
-

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 @dataclass
 class QAClassificationResult:
     """问答分类结果"""
+
     answer_class: Literal["qa", "open"]
     confidence: float
     reasons: list[str]
@@ -54,8 +55,7 @@ class QAClassifier:
 
         # 2. JSON来源 + 模式匹配 → 强Q-A信号
         has_json_source = any(
-            str(getattr(c, "source_path", "")).lower().endswith(".json")
-            for c in chunks
+            str(getattr(c, "source_path", "")).lower().endswith(".json") for c in chunks
         )
         if has_json_source and json_patterns:
             confidence += 0.8
@@ -151,12 +151,29 @@ class QAClassifier:
         query_lower = str(query).lower()
 
         fact_markers = (
-            "是什么", "定义", "组成", "区别", "含义", "包括", "多少",
-            "why", "what is", "difference", "define", "how many",
+            "是什么",
+            "定义",
+            "组成",
+            "区别",
+            "含义",
+            "包括",
+            "多少",
+            "why",
+            "what is",
+            "difference",
+            "define",
+            "how many",
         )
         process_markers = (
-            "怎么", "如何", "步骤", "流程", "执行", "落地",
-            "how to", "step", "process",
+            "怎么",
+            "如何",
+            "步骤",
+            "流程",
+            "执行",
+            "落地",
+            "how to",
+            "step",
+            "process",
         )
 
         has_fact = any(marker in query_lower for marker in fact_markers)

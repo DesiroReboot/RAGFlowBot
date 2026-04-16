@@ -1,0 +1,74 @@
+# Pre-commit configuration for RAGFlowBot-Memory
+# Install: pre-commit install
+# Run on all files: pre-commit run --all-files
+# Run on specific files: pre-commit run --files path/to/file.py
+
+default_language_version:
+  python: python3.12
+
+repos:
+  # Ruff - Fast Python linter and formatter
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.2
+    hooks:
+      # Run the linter
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        exclude: ^(tests/|__pycache__/|.*\.pyc)
+      # Run the formatter
+      - id: ruff-format
+        exclude: ^(tests/|__pycache__/|.*\.pyc)
+
+  # Black - Code formatter (fallback, ruff-format is primary)
+  - repo: https://github.com/psf/black
+    rev: 24.1.1
+    hooks:
+      - id: black
+        args: [--line-length=100]
+        exclude: ^(tests/|__pycache__/|.*\.pyc)
+
+  # Pylint - Code quality checker
+  - repo: local
+    hooks:
+      - id: pylint
+        name: pylint
+        entry: pylint
+        language: system
+        types: [python]
+        args:
+          - --max-line-length=100
+          - --disable=C0114,C0115,C0116  # Disable missing docstring warnings
+          - --disable=R0903,R0902,R0913,R0914,R0915,R0912,R0911  # Disable complexity warnings
+          - --disable=W0718  # Disable broad-exception-caught
+          - --fail-under=9.0
+        exclude: ^(tests/|__pycache__/|.*\.pyc)
+
+  # MyPy - Static type checker (optional, may have environment issues)
+  - repo: local
+    hooks:
+      - id: mypy
+        name: mypy
+        entry: mypy
+        language: system
+        types: [python]
+        args: [--no-error-summary, --ignore-missing-imports]
+        exclude: ^(tests/|__pycache__/|.*\.pyc)
+        pass_filenames: false
+        # Note: mypy may have DLL loading issues on some systems
+        # Comment out this hook if needed
+
+  # General checks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(tests/|.*\.md)
+      - id: end-of-file-fixer
+        exclude: ^(tests/|.*\.md)
+      - id: check-yaml
+        exclude: ^(config/|.*\.local\.yaml)
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: debug-statements
