@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 import math
 from pathlib import Path
 import re
+import xml.etree.ElementTree as ET
 from typing import Any
 
 from src.RAG.config.kbase_config import KBaseConfig
@@ -66,6 +68,10 @@ class DocumentParser:
         ext = file_path.suffix.lower()
         if ext == ".pdf":
             return self._parse_pdf(file_path)
+        if ext == ".json":
+            return self._parse_json(file_path)
+        if ext == ".xml":
+            return self._parse_xml(file_path)
         if ext in self.CODE_EXTENSIONS:
             content = self._read_text(file_path)
             return content, {"type": "code", "language": ext.lstrip(".")}
@@ -89,6 +95,108 @@ class DocumentParser:
             except UnicodeDecodeError:
                 continue
         return file_path.read_text(encoding="utf-8", errors="ignore")
+
+    def _parse_json(self, file_path: Path) -> tuple[str, dict[str, Any]]:
+        raw = self._read_text(file_path)
+        metadata: dict[str, Any] = {"type": "json", "language": "json"}
+        if not raw.strip():
+            metadata["parse_method"] = "json_empty"
+            return "", metadata
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            metadata["parse_method"] = "json_raw_fallback"
+            return raw, metadata
+
+        flattened = self._flatten_json(payload)
+        metadata["parse_method"] = "json_flatten"
+        return flattened or raw, metadata
+
+    def _parse_xml(self, file_path: Path) -> tuple[str, dict[str, Any]]:
+        raw = self._read_text(file_path)
+        metadata: dict[str, Any] = {"type": "xml", "language": "xml"}
+        if not raw.strip():
+            metadata["parse_method"] = "xml_empty"
+            return "", metadata
+        try:
+            root = ET.fromstring(raw)
+        except ET.ParseError:
+            metadata["parse_method"] = "xml_raw_fallback"
+            return raw, metadata
+
+        flattened = self._flatten_xml(root)
+        metadata["parse_method"] = "xml_flatten"
+        return flattened or raw, metadata
+
+    def _flatten_json(self, payload: Any) -> str:
+        lines: list[str] = []
+
+        def walk(node: Any, path: str) -> None:
+            if isinstance(node, dict):
+                if not node and path:
+                    lines.append(f"{path}: {{}}")
+                    return
+                for key, value in node.items():
+                    key_text = str(key).strip()
+                    if not key_text:
+                        continue
+                    next_path = f"{path}.{key_text}" if path else key_text
+                    walk(value, next_path)
+                return
+            if isinstance(node, list):
+                if not node:
+                    lines.append(f"{path}: []")
+                    return
+                for index, item in enumerate(node):
+                    next_path = f"{path}[{index}]" if path else f"[{index}]"
+                    walk(item, next_path)
+                return
+
+            value = self._scalar_to_text(node)
+            if path:
+                lines.append(f"{path}: {value}")
+            else:
+                lines.append(value)
+
+        walk(payload, "")
+        return "\n".join(line for line in lines if line.strip()).strip()
+
+    def _flatten_xml(self, root: ET.Element) -> str:
+        lines: list[str] = []
+
+        def walk(node: ET.Element, path: str) -> None:
+            tag = self._strip_xml_namespace(node.tag)
+            next_path = f"{path}/{tag}" if path else tag
+
+            for attr_name, attr_value in node.attrib.items():
+                attr_key = self._strip_xml_namespace(attr_name)
+                lines.append(f"{next_path}@{attr_key}: {attr_value}")
+
+            text = (node.text or "").strip()
+            if text:
+                lines.append(f"{next_path}: {text}")
+
+            for child in list(node):
+                walk(child, next_path)
+
+        walk(root, "")
+        return "\n".join(line for line in lines if line.strip()).strip()
+
+    def _strip_xml_namespace(self, name: str) -> str:
+        if "}" in name:
+            return name.rsplit("}", 1)[-1]
+        return name
+
+    def _scalar_to_text(self, value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, str):
+            return value
+        return str(value)
 
     def _parse_pdf(self, file_path: Path) -> tuple[str, dict[str, Any]]:
         if not file_path.exists():

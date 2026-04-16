@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any
 
 from src.core.search.context_selector import ContextSelector
@@ -8,6 +9,7 @@ from src.core.search.fusion import ReciprocalRankFusion
 from src.core.search.grader import ResultGrader
 from src.core.search.hybrid_retriever import HybridRetriever
 from src.core.search.query_preprocessor import QueryPreprocessor
+from src.core.search.reranker import NoopReranker, build_reranker
 from src.RAG.config.kbase_config import KBaseConfig
 
 
@@ -47,6 +49,15 @@ class LegacyRAGSearcher:
         max_chunks_per_source: int = 0,
         qa_anchor_enabled: bool = True,
         semantic_guard_enabled: bool = True,
+        rerank_enabled: bool = False,
+        rerank_provider: str = "noop",
+        rerank_model: str = "gte-rerank-v2",
+        rerank_base_url: str = "",
+        rerank_api_key: str = "",
+        rerank_top_n: int = 24,
+        rerank_weight: float = 0.35,
+        rerank_timeout_ms: int = 800,
+        rerank_max_retries: int = 1,
     ):
         self.db_path = db_path
         self.top_k = top_k
@@ -80,6 +91,23 @@ class LegacyRAGSearcher:
             source_quota_mode=source_quota_mode,
             max_chunks_per_source=max_chunks_per_source,
         )
+        self.rerank_enabled = bool(rerank_enabled)
+        self.rerank_provider = str(rerank_provider or "noop").strip().lower() or "noop"
+        self.rerank_model = str(rerank_model or "gte-rerank-v2").strip() or "gte-rerank-v2"
+        self.rerank_base_url = str(rerank_base_url or "").strip().rstrip("/")
+        self.rerank_api_key = str(rerank_api_key or "").strip()
+        self.rerank_top_n = max(1, int(rerank_top_n))
+        self.rerank_weight = max(0.0, min(1.0, float(rerank_weight)))
+        self.rerank_timeout_ms = max(100, int(rerank_timeout_ms))
+        self.rerank_max_retries = max(0, int(rerank_max_retries))
+        self.reranker = build_reranker(
+            self.rerank_provider,
+            model=self.rerank_model,
+            base_url=self.rerank_base_url,
+            api_key=self.rerank_api_key,
+            timeout_ms=self.rerank_timeout_ms,
+            max_retries=self.rerank_max_retries,
+        )
 
     def search(self, query: str) -> list[SearchResult]:
         results, _ = self.search_with_trace(query)
@@ -93,6 +121,19 @@ class LegacyRAGSearcher:
             vec_limit=self.vec_top_k,
         )
         branch_errors = hybrid_meta.get("branch_errors", {})
+        rerank_trace: dict[str, Any] = {
+            "enabled": self.rerank_enabled,
+            "provider": str(getattr(self.reranker, "provider", self.rerank_provider)),
+            "configured_provider": self.rerank_provider,
+            "input_count": 0,
+            "output_top_scores": [],
+            "top_n": self.rerank_top_n,
+            "weight": self.rerank_weight,
+            "timeout_ms": self.rerank_timeout_ms,
+            "model": self.rerank_model,
+            "success": False,
+            "latency_ms": 0,
+        }
 
         try:
             fused = self.fusion.fuse(fts_results, vec_results)
@@ -102,6 +143,7 @@ class LegacyRAGSearcher:
                 fused_results=fused,
                 query_intent=dict(preprocess.get("query_intent", {})),
             )
+            candidates, rerank_trace = self._apply_rerank(query=query, candidates=candidates)
             selected, citations = self.context_selector.select(
                 candidates=candidates,
                 source_scores=source_scores,
@@ -161,6 +203,7 @@ class LegacyRAGSearcher:
                     "vector_meta": hybrid_meta.get("vector_meta", {}),
                     "branch_errors": branch_errors,
                 },
+                "rerank": rerank_trace,
                 "citations": [],
                 "final_results": [
                     {
@@ -237,6 +280,7 @@ class LegacyRAGSearcher:
                 "vector_meta": hybrid_meta.get("vector_meta", {}),
                 "branch_errors": branch_errors,
             },
+            "rerank": rerank_trace,
             "citations": citations,
             "final_results": [
                 {
@@ -358,6 +402,102 @@ class LegacyRAGSearcher:
             "hard_filtered_candidates": list(hard_filtered or []),
             "conflict_pool_candidates": list(conflict_pool or []),
         }
+
+    def _apply_rerank(
+        self,
+        *,
+        query: str,
+        candidates: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        trace: dict[str, Any] = {
+            "enabled": self.rerank_enabled,
+            "provider": str(getattr(self.reranker, "provider", self.rerank_provider)),
+            "configured_provider": self.rerank_provider,
+            "input_count": 0,
+            "output_top_scores": [],
+            "top_n": self.rerank_top_n,
+            "weight": self.rerank_weight,
+            "timeout_ms": self.rerank_timeout_ms,
+            "model": self.rerank_model,
+            "success": False,
+            "latency_ms": 0,
+        }
+        if not candidates:
+            return candidates, trace
+        if not self.rerank_enabled:
+            trace["success"] = True
+            return candidates, trace
+
+        ranked_candidates = sorted(candidates, key=lambda row: float(row.get("score", 0.0)), reverse=True)
+        top_n = min(len(ranked_candidates), self.rerank_top_n)
+        rerank_pool = ranked_candidates[:top_n]
+        tail = ranked_candidates[top_n:]
+        trace["input_count"] = top_n
+
+        started_at = time.perf_counter()
+        try:
+            raw_scores = self.reranker.score(
+                query=query,
+                candidates=rerank_pool,
+                timeout_ms=self.rerank_timeout_ms,
+            )
+            if len(raw_scores) != len(rerank_pool):
+                raise ValueError(
+                    f"reranker score count mismatch: got={len(raw_scores)} expected={len(rerank_pool)}"
+                )
+            if isinstance(self.reranker, NoopReranker):
+                rerank_scores = [float(item.get("score", 0.0)) for item in rerank_pool]
+            else:
+                rerank_scores = self._minmax_normalize(raw_scores)
+
+            reranked_pool: list[dict[str, Any]] = []
+            for item, raw_score, rerank_score in zip(rerank_pool, raw_scores, rerank_scores, strict=False):
+                grading = dict(item.get("grading", {}))
+                grader_score = float(item.get("score", 0.0))
+                hybrid_score = ((1.0 - self.rerank_weight) * grader_score) + (
+                    self.rerank_weight * float(rerank_score)
+                )
+                grading["rerank_raw_score"] = round(float(raw_score), 6)
+                grading["rerank_score"] = round(float(rerank_score), 6)
+                grading["rerank_weight"] = round(self.rerank_weight, 6)
+                grading["hybrid_score"] = round(hybrid_score, 6)
+                grading["rerank_provider"] = str(trace["provider"])
+                reranked_pool.append(
+                    {
+                        **item,
+                        "grading": grading,
+                        "score": hybrid_score,
+                    }
+                )
+
+            reranked_pool.sort(key=lambda row: float(row.get("score", 0.0)), reverse=True)
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            trace["latency_ms"] = latency_ms
+            trace["success"] = True
+            trace["output_top_scores"] = [
+                {
+                    "file_uuid": str(item.get("file_uuid", "")),
+                    "chunk_id": int(item.get("chunk_id", 0)),
+                    "score": round(float(item.get("score", 0.0)), 6),
+                }
+                for item in reranked_pool[:5]
+            ]
+            return reranked_pool + tail, trace
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started_at) * 1000)
+            trace["latency_ms"] = latency_ms
+            trace["success"] = False
+            trace["error"] = str(exc)
+            return ranked_candidates, trace
+
+    def _minmax_normalize(self, values: list[float]) -> list[float]:
+        if not values:
+            return []
+        minimum = min(values)
+        maximum = max(values)
+        if maximum - minimum <= 1e-9:
+            return [1.0 for _ in values]
+        return [(float(value) - minimum) / (maximum - minimum) for value in values]
 
 
 # Backward-compatible alias.

@@ -9,7 +9,7 @@ from typing import Any
 class KBaseConfig:
     db_path: str = "DB/ec_bot.db"
     source_dir: str = r"E:\DATA\外贸电商知识库"
-    supported_extensions: tuple[str, ...] = (".md", ".txt", ".pdf")
+    supported_extensions: tuple[str, ...] = (".md", ".txt", ".pdf", ".json", ".xml")
     auto_sync_on_startup: bool = False
     auto_classification: bool = True
 

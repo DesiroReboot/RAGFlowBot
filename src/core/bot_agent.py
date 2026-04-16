@@ -116,6 +116,19 @@ class ReActAgent:
             max_chunks_per_source=config.search.max_chunks_per_source,
             qa_anchor_enabled=config.search.qa_anchor_enabled,
             semantic_guard_enabled=config.search.semantic_guard_enabled,
+            rerank_enabled=config.search.rerank_enabled,
+            rerank_provider=config.search.rerank_provider,
+            rerank_model=config.search.rerank_model,
+            rerank_base_url=config.search.rerank_base_url or config.embedding.base_url,
+            rerank_api_key=(
+                config.search.rerank_api_key
+                or config.embedding.api_key
+                or config.generation.api_key
+            ),
+            rerank_top_n=config.search.rerank_top_n,
+            rerank_weight=config.search.rerank_weight,
+            rerank_timeout_ms=config.search.rerank_timeout_ms,
+            rerank_max_retries=config.search.rerank_max_retries,
         )
         self.rag_searcher = self._build_rag_searcher()
         self.retrieval_provider = "ragflow" if self.rag_provider == "ragflow" else "legacy"

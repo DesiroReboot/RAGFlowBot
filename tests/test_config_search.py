@@ -22,18 +22,45 @@ def test_config_valid_values_override_env(monkeypatch) -> None:
                 "web_search_provider": "mock",
                 "web_search_max_results": 6,
                 "web_search_tavily_api_key": "config-api-key",
+                "rerank_enabled": True,
+                "rerank_provider": "api",
+                "rerank_model": "gte-rerank-v2",
+                "rerank_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "rerank_api_key": "config-rerank-key",
+                "rerank_top_n": 32,
+                "rerank_weight": 0.4,
+                "rerank_timeout_ms": 900,
+                "rerank_max_retries": 2,
             }
         },
     )
     monkeypatch.setenv("ECBOT_WEB_SEARCH_PROVIDER", "tavily")
     monkeypatch.setenv("ECBOT_TAVILY_API_KEY", "env-tavily-key")
     monkeypatch.setenv("ECBOT_WEB_SEARCH_MAX_RESULTS", "12")
+    monkeypatch.setenv("ECBOT_RERANK_ENABLED", "false")
+    monkeypatch.setenv("ECBOT_RERANK_PROVIDER", "noop")
+    monkeypatch.setenv("ECBOT_RERANK_MODEL", "bge-reranker-v2-m3")
+    monkeypatch.setenv("ECBOT_RERANK_BASE_URL", "https://invalid.example.com")
+    monkeypatch.setenv("ECBOT_RERANK_API_KEY", "env-rerank-key")
+    monkeypatch.setenv("ECBOT_RERANK_TOP_N", "16")
+    monkeypatch.setenv("ECBOT_RERANK_WEIGHT", "0.2")
+    monkeypatch.setenv("ECBOT_RERANK_TIMEOUT_MS", "600")
+    monkeypatch.setenv("ECBOT_RERANK_MAX_RETRIES", "5")
 
     cfg = Config(str(config_path))
 
     assert cfg.search.web_search_provider == "mock"
     assert cfg.search.web_search_tavily_api_key == "config-api-key"
     assert cfg.search.web_search_max_results == 6
+    assert cfg.search.rerank_enabled is True
+    assert cfg.search.rerank_provider == "api"
+    assert cfg.search.rerank_model == "gte-rerank-v2"
+    assert cfg.search.rerank_base_url == "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    assert cfg.search.rerank_api_key == "config-rerank-key"
+    assert cfg.search.rerank_top_n == 32
+    assert cfg.search.rerank_weight == 0.4
+    assert cfg.search.rerank_timeout_ms == 900
+    assert cfg.search.rerank_max_retries == 2
 
 
 def test_search_config_uses_defaults_when_values_missing(monkeypatch) -> None:
@@ -63,6 +90,11 @@ def test_search_config_uses_defaults_when_values_missing(monkeypatch) -> None:
     monkeypatch.delenv("ECBOT_RAGFLOW_TOP_K", raising=False)
     monkeypatch.delenv("ECBOT_RAGFLOW_MIN_SCORE", raising=False)
     monkeypatch.delenv("ECBOT_RAGFLOW_FALLBACK_TO_LEGACY", raising=False)
+    monkeypatch.delenv("ECBOT_RERANK_ENABLED", raising=False)
+    monkeypatch.delenv("ECBOT_RERANK_PROVIDER", raising=False)
+    monkeypatch.delenv("ECBOT_RERANK_TOP_N", raising=False)
+    monkeypatch.delenv("ECBOT_RERANK_WEIGHT", raising=False)
+    monkeypatch.delenv("ECBOT_RERANK_TIMEOUT_MS", raising=False)
 
     cfg = Config(str(config_path))
 
@@ -81,6 +113,7 @@ def test_search_config_uses_defaults_when_values_missing(monkeypatch) -> None:
     assert cfg.search.merge_step_min_evidence == 1
     assert cfg.search.merge_evidence_rag_top_k == 3
     assert cfg.search.merge_evidence_search_top_k == 2
+    assert cfg.knowledge_base.supported_extensions == (".md", ".txt", ".pdf", ".json", ".xml")
     assert cfg.knowledge_base.auto_init_on_startup is False
     assert cfg.knowledge_base.init_blocking is False
     assert cfg.knowledge_base.init_fail_open is True
@@ -92,6 +125,15 @@ def test_search_config_uses_defaults_when_values_missing(monkeypatch) -> None:
     assert cfg.ragflow.top_k == 5
     assert cfg.ragflow.min_score == 0.1
     assert cfg.ragflow.fallback_to_legacy is True
+    assert cfg.search.rerank_enabled is False
+    assert cfg.search.rerank_provider == "noop"
+    assert cfg.search.rerank_model == "gte-rerank-v2"
+    assert cfg.search.rerank_base_url == ""
+    assert cfg.search.rerank_api_key == ""
+    assert cfg.search.rerank_top_n == 24
+    assert cfg.search.rerank_weight == 0.35
+    assert cfg.search.rerank_timeout_ms == 800
+    assert cfg.search.rerank_max_retries == 1
 
 
 def test_model_sync_uses_shared_env_when_specific_values_missing(monkeypatch) -> None:

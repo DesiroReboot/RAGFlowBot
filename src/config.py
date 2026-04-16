@@ -198,6 +198,15 @@ class SearchConfig:
     qa_anchor_enabled: bool = True
     semantic_guard_enabled: bool = True
     paragraph_output_enabled: bool = True
+    rerank_enabled: bool = False
+    rerank_provider: str = "noop"
+    rerank_model: str = "gte-rerank-v2"
+    rerank_base_url: str = ""
+    rerank_api_key: str = ""
+    rerank_top_n: int = 24
+    rerank_weight: float = 0.35
+    rerank_timeout_ms: int = 800
+    rerank_max_retries: int = 1
 
 
 @dataclass
@@ -238,7 +247,7 @@ class GenerationConfig:
 @dataclass
 class KnowledgeBaseConfig:
     source_dir: str = r"E:\知识库\RailKB"
-    supported_extensions: tuple[str, ...] = (".md", ".txt", ".pdf")
+    supported_extensions: tuple[str, ...] = (".md", ".txt", ".pdf", ".json", ".xml")
     auto_sync_on_startup: bool = False
     auto_init_on_startup: bool = False
     init_blocking: bool = False
@@ -612,6 +621,78 @@ class Config:
                 ),
                 True,
             ),
+            rerank_enabled=_as_bool(
+                _env(
+                    "ECBOT_RERANK_ENABLED",
+                    search_data.get("rerank_enabled", False),
+                ),
+                False,
+            ),
+            rerank_provider=str(
+                _env(
+                    "ECBOT_RERANK_PROVIDER",
+                    search_data.get("rerank_provider", "noop"),
+                )
+            )
+            .strip()
+            .lower(),
+            rerank_model=str(
+                _env(
+                    "ECBOT_RERANK_MODEL",
+                    search_data.get("rerank_model", "gte-rerank-v2"),
+                )
+            ).strip(),
+            rerank_base_url=str(
+                _env(
+                    "ECBOT_RERANK_BASE_URL",
+                    search_data.get("rerank_base_url", ""),
+                )
+            ).strip(),
+            rerank_api_key=str(
+                _env(
+                    "ECBOT_RERANK_API_KEY",
+                    search_data.get("rerank_api_key", ""),
+                )
+            ).strip(),
+            rerank_top_n=max(
+                1,
+                int(
+                    _env(
+                        "ECBOT_RERANK_TOP_N",
+                        search_data.get("rerank_top_n", 24),
+                    )
+                ),
+            ),
+            rerank_weight=max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        _env(
+                            "ECBOT_RERANK_WEIGHT",
+                            search_data.get("rerank_weight", 0.35),
+                        )
+                    ),
+                ),
+            ),
+            rerank_timeout_ms=max(
+                100,
+                int(
+                    _env(
+                        "ECBOT_RERANK_TIMEOUT_MS",
+                        search_data.get("rerank_timeout_ms", 800),
+                    )
+                ),
+            ),
+            rerank_max_retries=max(
+                0,
+                int(
+                    _env(
+                        "ECBOT_RERANK_MAX_RETRIES",
+                        search_data.get("rerank_max_retries", 1),
+                    )
+                ),
+            ),
         )
         self.database = DatabaseConfig(
             db_path=str(_env("ECBOT_DB_PATH", db_data.get("db_path", "DB/ec_bot.db")))
@@ -694,7 +775,7 @@ class Config:
             ),
             supported_extensions=_as_tuple(
                 knowledge_base_data.get("supported_extensions"),
-                (".md", ".txt", ".pdf"),
+                (".md", ".txt", ".pdf", ".json", ".xml"),
             ),
             auto_sync_on_startup=kb_auto_startup,
             auto_init_on_startup=kb_auto_startup,
