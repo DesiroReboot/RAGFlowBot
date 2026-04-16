@@ -7,14 +7,16 @@ import os
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
+import sys
 
 from src.config import Config
 from src.RAG.config.kbase_config import KBaseConfig
 from src.RAG.kbase_manager import KBaseManager
 from src.RAG.readiness import is_index_ready, normalize_manifest_status
-from src.RAG.storage.manifest_store import ManifestStore
+from src.KB.manifest_store import ManifestStore
 from src.RAG.storage.sqlite_conn import connect
 from src.RAG.storage.sqlite_schema import ensure_schema
+from src.RAG.progress import create_reporter
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +163,17 @@ class KBaseStartupBootstrap:
                     "finished_at": datetime.now(UTC).isoformat(),
                 }
             try:
-                manager = KBaseManager(self._build_kbase_config())
+                # Determine if we should show progress bar
+                # Only show progress for blocking mode in a TTY environment
+                blocking = bool(self._state.get("effective_blocking", False))
+                is_tty = sys.stdout.isatty()
+                should_show_progress = blocking and is_tty
+
+                # Create appropriate progress reporter
+                progress_type = "rich" if should_show_progress else "json"
+                reporter = create_reporter(progress_type)
+
+                manager = KBaseManager(self._build_kbase_config(), progress_reporter=reporter)
                 manager.sync_configured_source()
                 readiness = self.readiness_snapshot()
                 success = bool(readiness.get("ready", False))

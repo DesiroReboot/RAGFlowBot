@@ -73,7 +73,12 @@ DDL: list[str] = [
         indexed_chunks INTEGER NOT NULL DEFAULT 0,
         partial_files INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
-        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        source_file_count INTEGER DEFAULT 0,
+        source_max_mtime TEXT DEFAULT '',
+        source_scanned_at TEXT DEFAULT '',
+        last_index_files INTEGER DEFAULT 0,
+        last_index_run_id TEXT DEFAULT ''
     );
     """,
     """
@@ -104,4 +109,27 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         ON CONFLICT(id) DO NOTHING
         """
     )
+    _migrate_index_manifest(conn)
     conn.commit()
+
+
+def _migrate_index_manifest(conn: sqlite3.Connection) -> None:
+    """Migrate existing index_manifest table to add new columns."""
+    try:
+        cursor = conn.execute("PRAGMA table_info(index_manifest)")
+        columns = {row[1] for row in cursor.fetchall()}
+
+        new_columns = {
+            "source_file_count": "INTEGER DEFAULT 0",
+            "source_max_mtime": "TEXT DEFAULT ''",
+            "source_scanned_at": "TEXT DEFAULT ''",
+            "last_index_files": "INTEGER DEFAULT 0",
+            "last_index_run_id": "TEXT DEFAULT ''",
+        }
+
+        for col_name, col_def in new_columns.items():
+            if col_name not in columns:
+                conn.execute(f"ALTER TABLE index_manifest ADD COLUMN {col_name} {col_def}")
+    except sqlite3.OperationalError:
+        # Table might not exist yet, will be created by DDL
+        pass

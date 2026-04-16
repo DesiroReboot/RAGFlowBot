@@ -11,6 +11,7 @@ sys.path.insert(0, str(project_root))
 from src.config import Config  # noqa: E402
 from src.RAG.config.kbase_config import KBaseConfig  # noqa: E402
 from src.RAG.kbase_manager import KBaseManager  # noqa: E402
+from src.RAG.progress import create_reporter  # noqa: E402
 
 
 def _build_kbase_config(config: Config, source_dir: str | None) -> KBaseConfig:
@@ -45,23 +46,52 @@ def _build_kbase_config(config: Config, source_dir: str | None) -> KBaseConfig:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build or refresh KB index.")
-    parser.add_argument("--config", default=None, help="Config file path. Defaults to config/config.json")
+    parser.add_argument(
+        "--config", default=None, help="Config file path. Defaults to config/config.json"
+    )
     parser.add_argument("--source-dir", default=None, help="Override knowledge base source directory")
     parser.add_argument(
         "--force-reindex",
         action="store_true",
         help="Rebuild index for all scanned files even when file hash is unchanged",
     )
+    parser.add_argument(
+        "--no-progress", action="store_true", help="禁用进度条（仅输出 JSON 结果）"
+    )
+    parser.add_argument(
+        "--progress-type",
+        choices=["auto", "rich", "json", "none"],
+        default="auto",
+        help=(
+            "进度条类型 (默认: auto) "
+            "auto - 自动检测终端环境 "
+            "rich - 始终显示 Rich 进度条 "
+            "json - 仅输出 JSON 格式结果 "
+            "none - 无进度输出"
+        ),
+    )
     args = parser.parse_args()
 
     config = Config(args.config)
     kbase_config = _build_kbase_config(config, args.source_dir)
-    manager = KBaseManager(kbase_config)
+
+    # Determine progress reporter type
+    progress_type = args.progress_type
+    if args.no_progress or progress_type == "none":
+        progress_type = "json"
+
+    # Create progress reporter
+    reporter = create_reporter(progress_type)
+
+    manager = KBaseManager(kbase_config, progress_reporter=reporter)
     result = manager.scan_and_process(
         kbase_config.source_dir,
         force_reindex=bool(args.force_reindex),
     )
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    # Only output JSON if not using rich reporter (rich reporter already displays results)
+    if progress_type != "rich":
+        print(json.dumps(result, ensure_ascii=False, indent=2))
 
     failed = int(result.get("failed", 0) or 0)
     errors = result.get("errors", [])

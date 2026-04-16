@@ -5,3 +5,4 @@ pypdf==5.4.0
 PyMuPDF==1.25.5
 Pillow==11.1.0
 pytesseract==0.3.13
+rich>=13.7.0

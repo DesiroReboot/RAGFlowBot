@@ -12,7 +12,7 @@ from src.config import Config  # noqa: E402
 from src.RAG.config.kbase_config import KBaseConfig  # noqa: E402
 from src.RAG.kbase_manager import KBaseManager  # noqa: E402
 from src.RAG.readiness import is_index_ready  # noqa: E402
-from src.RAG.storage.manifest_store import ManifestStore  # noqa: E402
+from src.KB.manifest_store import ManifestStore  # noqa: E402
 
 
 def main() -> int:

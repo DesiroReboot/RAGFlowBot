@@ -8,14 +8,17 @@ from src.RAG.classification.classifier import Classifier
 from src.RAG.config.kbase_config import KBaseConfig
 from src.RAG.indexing.indexer import Indexer
 from src.RAG.preprocessing.parser import DocumentParser
-from src.RAG.reader.builder import KnowledgeBaseBuilder
+from src.KB.builder import KnowledgeBaseBuilder
 from src.RAG.storage.conflict_resolver import ConflictResolver
 from src.RAG.storage.file_mapper import FileMapper
-from src.RAG.storage.manifest_store import ManifestStore
+from src.KB.manifest_store import ManifestStore
+from src.RAG.progress import ProgressReporter
 
 
 class KBaseManager:
-    def __init__(self, config: KBaseConfig | None = None):
+    def __init__(
+        self, config: KBaseConfig | None = None, progress_reporter: ProgressReporter | None = None
+    ):
         self.config = config or KBaseConfig()
         self.file_mapper = FileMapper(self.config.db_path)
         self.manifest_store = ManifestStore(self.config.db_path, ensure_schema=False)
@@ -23,7 +26,8 @@ class KBaseManager:
         self.classifier = Classifier(self.config)
         self.parser = DocumentParser(self.config)
         self.indexer = Indexer(self.config.db_path, self.config)
-        self.builder = KnowledgeBaseBuilder(self.config)
+        # Pass through the progress reporter to the builder
+        self.builder = KnowledgeBaseBuilder(self.config, progress_reporter=progress_reporter)
 
         if self.config.auto_sync_on_startup:
             self.sync_configured_source()

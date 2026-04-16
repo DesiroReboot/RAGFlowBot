@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from src.config import Config
 from src.fastapi_gateway.routes.diagnostics import create_diagnostics_router
 from src.fastapi_gateway.routes.health import create_health_router
+from src.fastapi_gateway.routes.kb import create_kb_router
 from src.fastapi_gateway.routes.startup_check import create_startup_check_router
 from src.fastapi_gateway.routes.webhook import create_webhook_router
 from src.fastapi_gateway.services.event_service import FeishuEventService
@@ -33,6 +34,7 @@ def create_app(
     app.include_router(create_startup_check_router(service))
     app.include_router(create_diagnostics_router(service))
     app.include_router(create_webhook_router(webhook_path, service))
+    app.include_router(create_kb_router(cfg))
 
     @app.on_event("startup")
     def _kb_startup_init() -> None:

@@ -5,7 +5,7 @@ from typing import Any
 
 from src.RAG.config.kbase_config import KBaseConfig
 from src.RAG.reader.embedding_client import EmbeddingClient
-from src.RAG.storage.manifest_store import ManifestStore
+from src.KB.manifest_store import ManifestStore
 
 
 class VecRetriever:

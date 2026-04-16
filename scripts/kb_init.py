@@ -13,6 +13,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.config import Config  # noqa: E402
 from src.RAG.config.kbase_config import KBaseConfig  # noqa: E402
 from src.RAG.kbase_manager import KBaseManager  # noqa: E402
+from src.RAG.progress import create_reporter  # noqa: E402
 
 
 def _build_kbase_config(cfg: Config, source_dir: str | None = None) -> KBaseConfig:
@@ -56,7 +57,9 @@ def _build_output(*, cfg: Config, source_dir: str, sync_result: dict[str, Any]) 
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Initialize or sync KB index from configured source_dir")
+    parser = argparse.ArgumentParser(
+        description="Initialize or sync KB index from configured source_dir"
+    )
     parser.add_argument(
         "--config",
         default=None,
@@ -72,15 +75,46 @@ def main() -> None:
         action="store_true",
         help="Rebuild index for all scanned files even when file hash is unchanged",
     )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="禁用进度条（仅输出 JSON 结果）",
+    )
+    parser.add_argument(
+        "--progress-type",
+        choices=["auto", "rich", "json", "none"],
+        default="auto",
+        help=(
+            "进度条类型 (默认: auto) "
+            "auto - 自动检测终端环境 "
+            "rich - 始终显示 Rich 进度条 "
+            "json - 仅输出 JSON 格式结果 "
+            "none - 无进度输出"
+        ),
+    )
     args = parser.parse_args()
 
     try:
         cfg = Config(config_path=args.config)
         source_dir = str(args.source_dir or cfg.knowledge_base.source_dir)
-        manager = KBaseManager(_build_kbase_config(cfg, source_dir=source_dir))
+
+        # Determine progress reporter type
+        progress_type = args.progress_type
+        if args.no_progress or progress_type == "none":
+            progress_type = "json"
+
+        # Create progress reporter
+        reporter = create_reporter(progress_type)
+
+        manager = KBaseManager(
+            _build_kbase_config(cfg, source_dir=source_dir), progress_reporter=reporter
+        )
         sync_result = manager.sync_configured_source(force_reindex=bool(args.force_reindex))
-        payload = _build_output(cfg=cfg, source_dir=source_dir, sync_result=sync_result)
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        # Only output JSON if not using rich reporter (rich reporter already displays results)
+        if progress_type != "rich":
+            payload = _build_output(cfg=cfg, source_dir=source_dir, sync_result=sync_result)
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
 
         failed = int(sync_result.get("failed", 0) or 0)
         errors = sync_result.get("errors", [])

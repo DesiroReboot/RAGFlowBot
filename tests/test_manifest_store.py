@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from src.RAG.storage.manifest_store import ManifestStore
+from src.KB.manifest_store import ManifestStore
 
 
 def test_get_manifest_bootstraps_schema_when_manifest_table_missing(tmp_path: Path) -> None:

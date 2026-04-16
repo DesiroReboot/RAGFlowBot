@@ -9,6 +9,49 @@ RAGFlowBot 是一个面向飞书的问答机器人，当前网关已重构为 **
 - 建议在 `ECBot` 仓库保留归档标签：`ecbot-archive-2026-04-11`
 - 可审计性说明：若 `ECBot` 与 `RAGFlowBot` 同时保留该提交 SHA，可证明两个仓库来源于同一历史根。
 
+## 架构概览
+
+当前系统采用三层架构：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Gateway Layer                              │
+│                (FastAPI / src/fastapi_gateway)               │
+│  - HTTP API: /health, /gateway/*, /webhook/feishu           │
+│  - Event handling & response formatting                      │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                    Core Layer                                 │
+│                  (src/core)                                  │
+│  - ReActAgent: Query orchestration                           │
+│  - SearchOrchestrator: Hybrid retrieval coordination          │
+│  - Web routing & Lite pipeline                               │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                    Knowledge Base Layer                       │
+│                    (src/KB)                                  │
+│  - KBStatusService: Index status & staleness detection       │
+│  - KnowledgeBaseBuilder: Index construction                  │
+│  - ManifestStore: Index metadata management                  │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│                    RAG Processing Layer                       │
+│                    (src/RAG)                                 │
+│  - Indexing: FTS + Vector embeddings                         │
+│  - Retrieval: Hybrid search (Fusion + Grading)               │
+│  - Classification & Quality filtering                        │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**架构说明：**
+- **Gateway Layer**: FastAPI 服务，处理 HTTP 请求和飞书事件
+- **Core Layer**: 查询编排和检索逻辑
+- **Knowledge Base Layer**: 知识库索引管理和状态监控（新增 `src/KB` 模块）
+- **RAG Processing Layer**: 底层检索和索引能力
+
 ## 当前网关状态
 
 - 网关实现：`src/fastapi_gateway`
@@ -20,11 +63,100 @@ RAGFlowBot 是一个面向飞书的问答机器人，当前网关已重构为 **
 
 默认接口如下（可通过配置调整 webhook 路径和端口）：
 
-- `GET /health`
-- `GET /gateway/startup-check`
-- `GET /gateway/self-check`
-- `POST /gateway/fullchain-visualize`
-- `POST /webhook/feishu`
+**健康检查：**
+- `GET /health` - 基础健康检查
+- `GET /gateway/startup-check` - 启动状态检查
+- `GET /gateway/self-check` - 完整自检
+
+**知识库状态（新增）：**
+- `GET /gateway/kb/status` - KB 索引状态与过期检测
+  - 返回：state（no_index/empty/partial/ready/stale/failed）
+  - 返回：indexed_files、indexed_chunks、source_file_count
+  - 返回：ready_for_query 标志
+
+**检索与诊断：**
+- `POST /gateway/fullchain-visualize` - 全链路可视化
+- `POST /webhook/feishu` - 飞书事件回调
+
+## 知识库管理 CLI
+
+### 1. 查看 KB 索引状态
+
+```powershell
+# 基础状态查看
+python scripts/kb_status.py
+
+# JSON 格式输出
+python scripts/kb_status.py --json
+
+# 自定义配置文件
+python scripts/kb_status.py --config path/to/config.json
+```
+
+**状态说明：**
+- `no_index` - 从未构建
+- `empty` - 已扫描但无文件
+- `partial` - 部分文件索引失败
+- `ready` - 索引就绪
+- `stale` - 索引已过期（源文件有变化）
+- `failed` - 构建失败
+
+**退出码：**
+- 0: ready
+- 1: no_index
+- 2: failed
+- 3: stale
+- 4: partial
+- 100: error
+
+### 2. 初始化/重建 KB 索引
+
+```powershell
+# 初始化索引（首次构建）
+python scripts/kb_init.py
+
+# 强制重建索引
+python scripts/kb_init.py --force-reindex
+
+# 指定源目录
+python scripts/kb_init.py --source-dir "E:\知识库\RailKB"
+
+# 指定配置文件
+python scripts/kb_init.py --config path/to/config.json
+```
+
+### 3. 增量同步 KB 索引
+
+```powershell
+# 增量同步（仅索引变更文件）
+python scripts/kb_build_index.py
+
+# 强制重建
+python scripts/kb_build_index.py --force-reindex
+
+# 指定源目录
+python scripts/kb_build_index.py --source-dir "E:\知识库\RailKB"
+```
+
+### 4. 检查索引就绪状态
+
+```powershell
+# 详细就绪检查
+python scripts/kb_check_readiness.py
+
+# JSON 格式输出
+python scripts/kb_check_readiness.py --json
+```
+
+### 5. 提升指定构建版本
+
+```powershell
+# 提升当前配置版本为活跃
+python scripts/kb_promote_manifest.py
+
+# 提升指定版本
+python scripts/kb_promote_manifest.py --build-version "2025-01-15"
+```
 
 ## 配置示例
 
@@ -45,6 +177,16 @@ RAGFlowBot 是一个面向飞书的问答机器人，当前网关已重构为 **
       "webhook_port": 8000,
       "webhook_path": "/webhook/feishu"
     }
+  },
+  "knowledge_base": {
+    "source_dir": "E:\\知识库\\RailKB",
+    "auto_init_on_startup": true,
+    "init_blocking": false,
+    "init_fail_open": true,
+    "build_version": "2025-01-15"
+  },
+  "database": {
+    "db_path": "DB/ec_bot.db"
   }
 }
 ```
@@ -127,7 +269,7 @@ docker compose down
 - 已提供 `Dockerfile`、`docker-compose.yml`、`.dockerignore`、`requirements.txt`。
 - 默认挂载目录：`./config`、`./DB`、`./logs`、`./Eval`、`./kb`。
 - 容器默认读取 `.env`，并将知识库目录固定为容器内 `/app/kb`（由 `ECBOT_KB_SOURCE_DIR=/app/kb` 覆盖）。
-- 当前镜像以“最小可运行”为目标；若需容器内 OCR，请在镜像中额外安装 `tesseract-ocr` 与对应语言包。
+- 当前镜像以"最小可运行"为目标；若需容器内 OCR，请在镜像中额外安装 `tesseract-ocr` 与对应语言包。
 - 已内置 Docker healthcheck：
   - `receive_mode=long_connection`：检查最近长连接状态文件（默认路径 `/tmp/ecbot_longconn_health.json`）。
   - `receive_mode=webhook`：检查 `http://127.0.0.1:8000/health`。
@@ -170,9 +312,19 @@ py -m src.main
 ## 本地联调
 
 ```powershell
+# 健康检查
 curl http://127.0.0.1:8000/health
+
+# 启动检查
 curl http://127.0.0.1:8000/gateway/startup-check
+
+# 完整自检
 curl http://127.0.0.1:8000/gateway/self-check
+
+# KB 状态检查（新增）
+curl http://127.0.0.1:8000/gateway/kb/status
+
+# 全链路可视化
 curl -X POST http://127.0.0.1:8000/gateway/fullchain-visualize -H "Content-Type: application/json" -d "{\"query\":\"测试问题\"}"
 ```
 
@@ -193,6 +345,12 @@ https://<your-public-domain>/webhook/feishu
 
 ```powershell
 python -m pytest -q tests/test_fastapi_gateway_runtime.py tests/test_fastapi_gateway_handler.py
+```
+
+KB 状态测试：
+
+```powershell
+python -m pytest -q tests/test_kbase_startup_bootstrap.py tests/test_manifest_store.py
 ```
 
 ## Golden Set 固定 Pipeline
@@ -230,4 +388,24 @@ python scripts/run_golden_pipeline.py --set-ids 0,1,2,3,4 --dry-run
 
 运行记录会写入：`Eval/pipeline/golden-set.pipeline.json`。
 
+## 常见问题
 
+### KB 索引状态异常
+
+```powershell
+# 查看当前状态
+python scripts/kb_status.py
+
+# 如果状态为 stale，执行增量同步
+python scripts/kb_build_index.py
+
+# 如果状态为 failed 或 no_index，执行完整初始化
+python scripts/kb_init.py --force-reindex
+```
+
+### 配置文件位置
+
+- 主配置：`config/config.json`
+- 环境变量：`.env`（从 `.env.example` 复制）
+- 数据库：`DB/ec_bot.db`
+- 知识库源：默认 `E:\知识库\RailKB`

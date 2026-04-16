@@ -9,7 +9,7 @@ project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 from src.config import Config  # noqa: E402
-from src.RAG.storage.manifest_store import ManifestStore  # noqa: E402
+from src.KB.manifest_store import ManifestStore  # noqa: E402
 
 
 def main() -> int:

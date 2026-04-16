@@ -5,7 +5,7 @@ from pathlib import Path
 
 from src.config import Config
 from src.RAG.startup_bootstrap import KBaseStartupBootstrap
-from src.RAG.storage.manifest_store import ManifestStore
+from src.KB.manifest_store import ManifestStore
 
 
 def _build_config(tmp_path: Path, *, auto_init: bool, blocking: bool, fail_open: bool) -> Config:

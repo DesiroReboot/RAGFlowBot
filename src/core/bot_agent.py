@@ -32,7 +32,8 @@ from src.RAG.config.kbase_config import KBaseConfig
 from src.RAG.readiness import is_index_ready
 from src.RAG.storage.sqlite_conn import connect
 from src.RAG.storage.sqlite_schema import ensure_schema
-from src.RAG.storage.manifest_store import ManifestStore
+from src.KB.manifest_store import ManifestStore
+from src.KB.status_service import KBStatusService
 
 
 @dataclass
@@ -96,6 +97,10 @@ class ReActAgent:
             build_version=config.knowledge_base.build_version,
         )
         self.manifest_store = ManifestStore(config.database.db_path, ensure_schema=False)
+        self.kb_status_service = KBStatusService(
+            db_path=config.database.db_path,
+            source_dir=config.knowledge_base.source_dir,
+        )
         self.rag_provider = self._resolve_rag_provider()
         self.legacy_rag_searcher = LegacyRAGSearcher(
             db_path=config.database.db_path,
@@ -588,36 +593,90 @@ class ReActAgent:
                 "manifest": {},
             }
 
-        manifest_store = getattr(self, "manifest_store", None)
-        if manifest_store is None or not hasattr(manifest_store, "get_manifest"):
+        kb_status_service = getattr(self, "kb_status_service", None)
+        if kb_status_service is None or not hasattr(kb_status_service, "get_status"):
+            # Fallback to old logic if KBStatusService is not available
+            manifest_store = getattr(self, "manifest_store", None)
+            if manifest_store is None or not hasattr(manifest_store, "get_manifest"):
+                return {
+                    "ready": True,
+                    "blocked": False,
+                    "status": "unknown",
+                    "reason": "manifest_store_unavailable",
+                    "manifest": {},
+                }
+
+            try:
+                raw_manifest = manifest_store.get_manifest()
+            except Exception:
+                return {
+                    "ready": True,
+                    "blocked": False,
+                    "status": "unknown",
+                    "reason": "manifest_read_error",
+                    "manifest": {},
+                }
+
+            manifest = raw_manifest if isinstance(raw_manifest, dict) else {}
+            ready, reason, status = is_index_ready(manifest, self._index_counts_snapshot())
             return {
-                "ready": True,
-                "blocked": False,
-                "status": "unknown",
-                "reason": "manifest_store_unavailable",
-                "manifest": {},
+                "ready": bool(ready),
+                "blocked": not bool(ready),
+                "status": status,
+                "reason": reason,
+                "manifest": manifest,
             }
 
+        # Use KBStatusService for unified status checking
         try:
-            raw_manifest = manifest_store.get_manifest()
-        except Exception:
+            status = kb_status_service.get_status()
+            ready = status.state in {"ready", "partial"}
             return {
-                "ready": True,
-                "blocked": False,
-                "status": "unknown",
-                "reason": "manifest_read_error",
-                "manifest": {},
+                "ready": ready,
+                "blocked": not ready,
+                "status": status.state,
+                "reason": status.reason,
+                "manifest": {
+                    "status": status.state,
+                    "indexed_files": status.indexed_files,
+                    "indexed_chunks": status.indexed_chunks,
+                    "source_file_count": status.source_file_count,
+                    "source_scanned_at": status.source_scanned_at,
+                    "last_index_run_id": status.last_index_run_id,
+                },
             }
+        except Exception:
+            # Fallback to old logic on error
+            manifest_store = getattr(self, "manifest_store", None)
+            if manifest_store is None or not hasattr(manifest_store, "get_manifest"):
+                return {
+                    "ready": True,
+                    "blocked": False,
+                    "status": "unknown",
+                    "reason": "status_service_error",
+                    "manifest": {},
+                }
 
-        manifest = raw_manifest if isinstance(raw_manifest, dict) else {}
-        ready, reason, status = is_index_ready(manifest, self._index_counts_snapshot())
-        return {
-            "ready": bool(ready),
-            "blocked": not bool(ready),
-            "status": status,
-            "reason": reason,
-            "manifest": manifest,
-        }
+            try:
+                raw_manifest = manifest_store.get_manifest()
+            except Exception:
+                return {
+                    "ready": True,
+                    "blocked": False,
+                    "status": "unknown",
+                    "reason": "manifest_read_error",
+                    "manifest": {},
+                }
+
+            manifest = raw_manifest if isinstance(raw_manifest, dict) else {}
+            ready, reason, status = is_index_ready(manifest, self._index_counts_snapshot())
+            return {
+                "ready": bool(ready),
+                "blocked": not bool(ready),
+                "status": status,
+                "reason": reason,
+                "manifest": manifest,
+            }
 
     def _index_counts_snapshot(self) -> dict[str, int]:
         counts = {
