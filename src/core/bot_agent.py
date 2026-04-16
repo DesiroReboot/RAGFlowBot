@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from src.config import Config
+from src.core.classification.qa_classifier import QAClassifier, QAClassificationResult
 from src.core.generation import GenerationClient
 from src.core.search.lite_gate import LOW_RELEVANCE_REASON_CODE, build_template_response
 from src.core.search.orchestrator import SearchOrchestrator, UnifiedSearchHit
@@ -48,7 +49,9 @@ class AgentResponse:
 class AnswerDraft:
     query: str
     theme: str
-    answer_mode: str = "fact_qa"
+    answer_mode: str = "fact_qa"  # 保留以兼容
+    answer_class: str = "open"  # 新字段：qa/open
+    classification: QAClassificationResult | None = None  # 新增：分类详情
     steps: list[str] = field(default_factory=list)
     key_points: list[str] = field(default_factory=list)
     point_source_tags: list[str] = field(default_factory=list)
@@ -164,6 +167,8 @@ class ReActAgent:
         )
         # Backward-compatible alias for any legacy direct access.
         self.searcher = self.rag_searcher
+        # Initialize QA classifier
+        self.qa_classifier = QAClassifier()
 
     def _resolve_rag_provider(self) -> str:
         raw = str(getattr(getattr(self.config, "search", None), "rag_provider", "legacy")).strip().lower()
@@ -949,8 +954,19 @@ class ReActAgent:
         query_terms = self._query_terms(query)
         theme = self._detect_theme(query, selected)
         evidence = self._extract_evidence(query=query, selected=selected, limit=6)
-        answer_mode = self._route_answer_mode(query=query, selected=selected)
-        steps = self._build_thematic_steps(theme=theme, query_terms=query_terms) if answer_mode != "fact_qa" else []
+
+        # 新增：QA分类
+        classification = self.qa_classifier.classify(query=query, chunks=selected)
+
+        # 替换：用answer_class替换answer_mode
+        # answer_mode = self._route_answer_mode(query=query, selected=selected)  # 删除
+
+        # 根据分类决定是否需要steps
+        answer_mode = classification.answer_class  # 使用新的分类
+        steps = []
+        if classification.answer_class == "open":
+            steps = self._build_thematic_steps(theme=theme, query_terms=query_terms)
+
         source_rows, source_tags = self._build_source_rows(selected=selected, citations=citations)
         if not source_rows:
             source_rows = ["[S1] 无可用来源 | 片段缺失 | reference"]
@@ -962,8 +978,12 @@ class ReActAgent:
 
         key_points = self._build_key_points(query=query, evidence=evidence, selected=selected, limit=4)
         point_source_tags = [source_tags[idx % len(source_tags)] for idx, _ in enumerate(key_points)] if key_points else []
-        if filtered_facts and answer_mode == "fact_qa":
-            key_points = [str(fact.get("statement", "")).strip() for fact in filtered_facts[:4] if str(fact.get("statement", "")).strip()]
+
+        # Q-A类优先使用fact_units
+        if classification.answer_class == "qa" and filtered_facts:
+            key_points = [str(fact.get("statement", "")).strip()
+                          for fact in filtered_facts[:4]
+                          if str(fact.get("statement", "")).strip()]
             point_source_tags = [
                 source_tag_map.get(str(fact.get("source", "")).strip(), source_tags[0])
                 for fact in filtered_facts[: len(key_points)]
@@ -972,7 +992,9 @@ class ReActAgent:
         return AnswerDraft(
             query=query,
             theme=theme,
-            answer_mode=answer_mode,
+            answer_mode=answer_mode,  # 使用新的分类
+            answer_class=classification.answer_class,  # 新字段：qa/open
+            classification=classification,  # 新增：保存分类结果
             steps=steps,
             key_points=key_points,
             point_source_tags=point_source_tags,
@@ -1083,10 +1105,15 @@ class ReActAgent:
             if str(citation.get("source", "")).strip()
         ]
         paragraph_output = self._paragraph_output_enabled()
+
+        # 获取分类结果
+        classification = getattr(draft, "classification", None)
+        answer_class = classification.answer_class if classification else "open"
+
         rewritten = self.generation_client.rewrite(
             query=draft.query,
             template_answer=template_answer,
-            answer_mode=draft.answer_mode,
+            answer_class=answer_class,  # 新增参数
             key_points=draft.key_points,
             steps=draft.steps,
             evidence=draft.evidence,

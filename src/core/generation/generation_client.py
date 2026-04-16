@@ -30,7 +30,8 @@ class GenerationClient:
         *,
         query: str,
         template_answer: str,
-        answer_mode: str = "fact_qa",
+        answer_class: str = "open",  # 新参数，替换answer_mode
+        answer_mode: str | None = None,  # 保留以兼容旧调用
         key_points: list[str] | None = None,
         steps: list[str],
         evidence: list[str],
@@ -40,17 +41,17 @@ class GenerationClient:
         if not self.available:
             raise RuntimeError("generation client unavailable")
 
-        format_instruction = (
-            "输出结构：先给自然段回答，再给“来源：”区块。不要输出“要点：/执行建议：”标题。"
-            if paragraph_output
-            else "输出结构：保留“要点：”“来源：”，若有步骤再给“执行建议：”。"
-        )
-        system_prompt = (
-            "你是企业知识库问答的中文改写编辑器。"
-            "你只能重写表达，不能新增事实、不能新增来源、不能删掉关键关系映射。"
-            "必须严格基于给定证据与来源。"
-            f"{format_instruction}"
-        )
+        # 向后兼容：answer_mode映射到answer_class
+        if answer_mode and answer_class == "open":
+            # 映射逻辑：fact_qa -> qa, procedure/mixed -> open
+            answer_class = "qa" if answer_mode == "fact_qa" else "open"
+
+        # 根据answer_class选择system prompt
+        from src.core.classification.prompt_templates import get_system_prompt
+
+        system_prompt = get_system_prompt(answer_class)
+
+        # 移除原有的format_instruction逻辑（已包含在prompt模板中）
         evidence_block = "\n".join(f"- {line}" for line in evidence) if evidence else "- 无"
         key_points_block = (
             "\n".join(f"- {line}" for line in (key_points or []) if str(line).strip())
@@ -62,7 +63,7 @@ class GenerationClient:
 
         user_prompt = (
             f"用户问题：{query}\n\n"
-            f"回答模式：{answer_mode}\n\n"
+            f"回答类别：{answer_class}\n\n"
             f"模板答案：\n{template_answer}\n\n"
             f"可用要点：\n{key_points_block}\n\n"
             f"可用步骤：\n{steps_block}\n\n"
